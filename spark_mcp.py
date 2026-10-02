@@ -36,6 +36,10 @@ SEARCH_DB = os.path.join(SPARK_CORE_DATA, "search_fts5.sqlite")
 CONTACTS_DB = os.path.join(SPARK_CORE_DATA, "contactsDictionary4.sqlite")
 CALENDAR_DB = os.path.join(SPARK_CORE_DATA, "calendarsapi.sqlite")
 SETTINGS_DB = os.path.join(SPARK_CORE_DATA, "settings.sqlite")
+# Spark CLI. "Setup CLI" in Spark Settings > AI Agents creates /usr/local/bin/spark; Spark only
+# authorizes calls made through it, not the SparklyRemote binary inside the .app.
+SPARK_CLI = next((p for p in ("/usr/local/bin/spark", "/opt/homebrew/bin/spark") if os.path.exists(p)),
+                 "/usr/local/bin/spark")
 
 CATEGORY_MAP = {
     0: "other",
@@ -175,6 +179,33 @@ def find_cached_attachment_file(account_pk, msg_pk, att_name, att_url=None):
     # No name-only fallback: names like image001.png or invite.ics repeat across messages,
     # so matching by filename alone returns another message's file.
     return None
+
+
+def run_spark_cli(args, timeout=120):
+    """Run one subcommand of Spark Desktop's bundled CLI, return stdout.
+
+    Needs Spark running and the agent connected in Settings -> AI Agents.
+    Only subcommands from Spark's own tool catalog are allowed.
+    """
+    if args[0] not in {"attachment", "tools"} | {s["command"] for s in CLI_CATALOG.values()}:
+        raise ValueError(f"Spark CLI subcommand not allowed: {args[0]}")
+    if not os.path.exists(SPARK_CLI):
+        raise RuntimeError(f"Spark CLI not found: {SPARK_CLI}")
+    res = subprocess.run([SPARK_CLI] + [str(a) for a in args],
+                         capture_output=True, text=True, timeout=timeout)
+    if res.returncode != 0:
+        raise RuntimeError(((res.stdout or "") + (res.stderr or "")).strip() or f"Spark CLI exit code {res.returncode}")
+    return res.stdout
+
+
+def download_attachment_via_cli(attachment_pk):
+    """Ask Spark Desktop to download an uncached attachment. Returns the local path."""
+    out = run_spark_cli(["attachment", int(attachment_pk)])
+    m = re.search(r"^\s*Path:\s*(.+?)\s*$", out, re.M)
+    path = m.group(1) if m else None
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(f"Spark CLI gave no usable path: {out.strip()[:300]}")
+    return path
 
 
 def safe_filename(name, fallback):
@@ -578,7 +609,7 @@ def spark_get_thread(conversation_id=None, message_id=None, format="text", exclu
         conn.close()
 
 
-def spark_get_attachment(attachment_id=None, message_id=None, filename=None):
+def spark_get_attachment(attachment_id=None, message_id=None, filename=None, download=True):
     conn = get_ro_conn(MESSAGES_DB)
     try:
         c = conn.cursor()
@@ -623,16 +654,27 @@ def spark_get_attachment(attachment_id=None, message_id=None, filename=None):
         att_url = att["attachmentURL"]
 
         found_path = find_cached_attachment_file(account_pk, msg_pk, att_name, att_url)
+        downloaded, download_error = False, None
+        if not found_path and download:
+            try:
+                found_path = download_attachment_via_cli(att["pk"])
+                downloaded = True
+            except Exception as e:
+                download_error = str(e)
 
-        return {
+        result = {
             "attachment_id": att["pk"],
             "message_id": msg_pk,
             "filename": att_name,
             "size_bytes": att["attachmentSize"],
             "mime_type": att["attachmentMIMEType"],
             "cached_locally": found_path is not None,
+            "downloaded_now": downloaded,
             "file_path": found_path
         }
+        if download_error:
+            result["download_error"] = download_error
+        return result
     finally:
         conn.close()
 
@@ -1596,9 +1638,10 @@ def spark_get_latest_otp(service=None, max_age_hours=24):
     }
 
 
-def spark_batch_export_attachments(target_dir, file_extension=None, query=None, sender=None, limit=50):
+def spark_batch_export_attachments(target_dir, file_extension=None, query=None, sender=None, limit=50, download=True):
     """
-    Batch export cached attachments matching filters to a local directory.
+    Batch export attachments matching filters to a local directory.
+    Uncached ones are downloaded through Spark's CLI when download is true.
     """
     limit = max(1, min(int(limit), 100))
     dest_dir = os.path.expanduser(target_dir)
@@ -1637,8 +1680,14 @@ def spark_batch_export_attachments(target_dir, file_extension=None, query=None, 
 
         exported = []
         skipped = 0
+        download_errors = set()
         for r in rows:
             cached_path = find_cached_attachment_file(r["accountPk"], r["messagePk"], r["attachmentName"], r["attachmentURL"])
+            if not cached_path and download:
+                try:
+                    cached_path = download_attachment_via_cli(r["attachmentPk"])
+                except Exception as e:
+                    download_errors.add(str(e))
             if not cached_path or not os.path.exists(cached_path):
                 skipped += 1
                 continue
@@ -1662,6 +1711,7 @@ def spark_batch_export_attachments(target_dir, file_extension=None, query=None, 
             "target_dir": dest_dir,
             "exported_count": len(exported),
             "skipped_count": skipped,
+            "download_errors": sorted(download_errors),
             "files": exported
         }
     finally:
@@ -1966,13 +2016,14 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_get_attachment",
-        "description": "Locate an attachment file from Spark's local cache on disk and inspect details.",
+        "description": "Locate an attachment file on disk and inspect details. If Spark has not cached it yet, downloads it via Spark's bundled CLI (needs Spark running and Settings > AI Agents enabled).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "attachment_id": {"type": "integer", "description": "ID of the attachment from spark_get_message or spark_search_attachments."},
                 "message_id": {"type": "integer", "description": "Message ID containing the attachment."},
-                "filename": {"type": "string", "description": "Name or part of filename of the attachment."}
+                "filename": {"type": "string", "description": "Name or part of filename of the attachment."},
+                "download": {"type": "boolean", "description": "Download the file through Spark if not cached (default true).", "default": True}
             }
         }
     },
@@ -2150,7 +2201,7 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_batch_export_attachments",
-        "description": "Batch export cached attachments matching filters (file extension, sender, search term) to a local directory.",
+        "description": "Batch export attachments matching filters (file extension, sender, search term) to a local directory. Uncached files are downloaded through Spark's CLI.",
         "inputSchema": {
             "type": "object",
             "required": ["target_dir"],
@@ -2159,7 +2210,8 @@ TOOLS_SCHEMA = [
                 "file_extension": {"type": "string", "description": "Optional file extension to filter by (e.g. 'pdf', 'xlsx', 'docx')."},
                 "query": {"type": "string", "description": "Optional search term to filter attachment name or email subject."},
                 "sender": {"type": "string", "description": "Optional sender name or email address."},
-                "limit": {"type": "integer", "description": "Maximum number of files to export (default 50).", "default": 50}
+                "limit": {"type": "integer", "description": "Maximum number of files to export (default 50).", "default": 50},
+                "download": {"type": "boolean", "description": "Download uncached files through Spark (default true).", "default": True}
             }
         }
     },
@@ -2177,6 +2229,72 @@ TOOLS_SCHEMA = [
         }
     }
 ]
+
+# --- Spark CLI delegation ---------------------------------------------------
+# Writes, calendar, drafts, teams and meetings are delegated to Spark's own CLI, the same
+# backend as the official Spark MCP. The tool list comes from `spark tools`, the catalog Spark
+# publishes, so names, parameters and access levels always match the installed Spark version.
+CLI_CATALOG = {}  # tool name -> catalog entry; filled by refresh_cli_catalog()
+CLI_OUTPUT_LIMIT = 30000
+
+
+def refresh_cli_catalog():
+    """(Re)load `spark tools`. Leaves the catalog empty when Spark is not running."""
+    try:
+        tools = json.loads(run_spark_cli(["tools"], timeout=15))["tools"]
+    except Exception:
+        return
+    CLI_CATALOG.clear()
+    CLI_CATALOG.update({"spark_cli_" + t["command"].replace("-", "_"): t for t in tools})
+
+
+def cli_tool_schemas():
+    schemas = []
+    for name, t in CLI_CATALOG.items():
+        props = {}
+        for p in t["parameters"]:
+            prop = {"type": p["type"], "description": p.get("description", "")}
+            if p["type"] == "array":
+                prop["items"] = p.get("items", {"type": "string"})
+            props[p["name"]] = prop
+        schema = {"type": "object", "properties": props}
+        required = [p["name"] for p in t["parameters"] if p.get("required")]
+        if required:
+            schema["required"] = required
+        schemas.append({"name": name, "description": t["description"] + " (via Spark CLI)", "inputSchema": schema})
+    return schemas
+
+
+def call_cli_tool(name, kw):
+    t = CLI_CATALOG[name]
+    params = {p["name"]: p for p in t["parameters"]}
+    unknown = set(kw) - set(params)
+    if unknown:
+        raise ValueError(f"Unknown arguments: {sorted(unknown)}")
+    args = [t["command"]]
+    for p in t["parameters"]:  # positionals first, in catalog order
+        v = kw.get(p["name"])
+        if "flag" not in p:
+            if v in (None, "", []):
+                if p.get("required"):
+                    raise ValueError(f"Missing required argument: {p['name']}")
+            else:
+                args.extend(v if isinstance(v, list) else [v])
+    for p in t["parameters"]:
+        v = kw.get(p["name"])
+        if "flag" not in p or v is None:
+            continue
+        if p["type"] == "boolean":
+            if v:
+                args.append(p["flag"])
+        else:
+            for item in (v if isinstance(v, list) else [v]):
+                args.extend([p["flag"], item])
+    out = run_spark_cli(args).rstrip()
+    if len(out) > CLI_OUTPUT_LIMIT:  # e.g. `search <query>` returns 20 full bodies
+        out = out[:CLI_OUTPUT_LIMIT] + f"\n\n[truncated: {len(out)} chars total. Narrow the query/filter or use a smaller page_size.]"
+    return {"output": out}
+
 
 TOOL_NAMES = {t["name"] for t in TOOLS_SCHEMA}
 
@@ -2214,11 +2332,12 @@ def handle_request(req):
         }
 
     if method == "tools/list":
+        refresh_cli_catalog()
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "tools": TOOLS_SCHEMA
+                "tools": TOOLS_SCHEMA + cli_tool_schemas()
             }
         }
 
@@ -2228,9 +2347,14 @@ def handle_request(req):
 
         try:
             # Schema names are the allowlist; argument defaults live on the functions.
-            if tool_name not in TOOL_NAMES:
-                raise ValueError(f"Unknown tool: {tool_name}")
-            res = globals()[tool_name](**args)
+            if tool_name in TOOL_NAMES:
+                res = globals()[tool_name](**args)
+            else:
+                if tool_name not in CLI_CATALOG:
+                    refresh_cli_catalog()
+                if tool_name not in CLI_CATALOG:
+                    raise ValueError(f"Unknown tool: {tool_name} (Spark CLI tools need Spark running)")
+                res = call_cli_tool(tool_name, args)
 
             return {
                 "jsonrpc": "2.0",

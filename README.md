@@ -9,14 +9,16 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 ## Highlights
 
 - **Single file, zero dependencies.** One script, `spark_mcp.py`, using only the Python 3 standard library. Speaks JSON-RPC over stdio.
-- **Read-only.** Spark databases are opened with `?mode=ro`. Spark uses WAL mode, so reading never blocks Spark itself.
-- **Never sends mail.** New emails and replies only open as drafts in the Spark composer. You review and press Send yourself.
-- **Local only.** The server makes no network requests.
+- **Local reads are read-only.** Spark databases are opened with `?mode=ro`. Spark uses WAL mode, so reading never blocks Spark itself.
+- **Never sends mail.** The `spark_cli_draft` tool only creates drafts. New emails and replies only open as drafts in the Spark composer. You review and press Send yourself.
+- **No network requests.** The server itself talks only to local files and the local Spark app.
 - **HTML to text.** Strips styles and scripts and returns readable message text.
 - **Quote stripping.** Optionally returns only the new text of a reply, without repeated quoted history.
 - **Language detection.** Returns the message language (`de`, `en`, `ru`, ...) detected by Spark.
 - **Unreplied emails.** Personal inbox emails that have no reply yet.
 - **Smart reply.** Replies go to the `Reply-To` address when present and get a signature that matches the message language (RU/DE/EN).
+- **Auto-download attachments.** Files Spark has not cached yet are downloaded through the Spark CLI (see below).
+- **Full Spark CLI coverage (`spark_cli_*` tools).** Calendar events and RSVP, availability, drafts, comments, email and contact actions, templates, teams, meetings and Spark's own semantic search are delegated to Spark's CLI, the same backend as the official Spark MCP. The tool list is read from `spark tools`, so it always matches your Spark version and access level. Setup: in Spark **Settings > AI Agents** click **Setup CLI** (this creates `/usr/local/bin/spark`) and set an access level per account. Spark must be running. These tools can write (archive, snooze, create events) up to the level you grant; local SQLite tools work without Spark running.
 - **Calendar invites.** Parses `VEVENT` blocks from `.ics` attachments (respects `TZID`, decodes RFC 5545 escapes).
 - **Link extraction.** Splits message links into action/tracking, unsubscribe and other links.
 - **Full-text search.** Uses Spark's own FTS5 indexes for messages (prefix search) and attachment contents.
