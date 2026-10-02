@@ -10,27 +10,25 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 
 - **Single file, zero dependencies.** One script, `spark_mcp.py`, using only the Python 3 standard library. Speaks JSON-RPC over stdio.
 - **Local reads are read-only.** Spark databases are opened with `?mode=ro`. Spark uses WAL mode, so reading never blocks Spark itself.
-- **Never sends mail.** The `spark_cli_draft` tool only creates drafts. New emails and replies only open as drafts in the Spark composer. You review and press Send yourself.
+- **Local tools never send mail.** `spark_compose_email` and `spark_reply_to_email` only open drafts in the Spark composer. The delegated `spark_cli_*` tools can act up to the access level you grant in Spark: `spark_cli_action` can send and archive, `spark_cli_draft` can delete drafts permanently, and `spark_cli_event` can send invitations. Grant only the access you want an agent to have.
 - **No network requests.** The server itself talks only to local files and the local Spark app.
 - **HTML to text.** Strips styles and scripts and returns readable message text.
 - **Quote stripping.** Optionally returns only the new text of a reply, without repeated quoted history.
 - **Language detection.** Returns the message language (`de`, `en`, `ru`, ...) detected by Spark.
 - **Unreplied emails.** Personal inbox emails that have no reply yet.
 - **Smart reply.** Replies go to the `Reply-To` address when present and get a signature that matches the message language (RU/DE/EN).
-- **Auto-download attachments.** Files Spark has not cached yet are downloaded through the Spark CLI (see below).
 - **Full Spark CLI coverage (`spark_cli_*` tools).** Calendar events and RSVP, availability, drafts, comments, email and contact actions, templates, teams, meetings and Spark's own semantic search are delegated to Spark's CLI, the same backend as the official Spark MCP. The tool list is read from `spark tools`, so it always matches your Spark version and access level. Setup: in Spark **Settings > AI Agents** click **Setup CLI** (this creates `/usr/local/bin/spark`) and set an access level per account. Spark must be running. These tools can write (archive, snooze, create events) up to the level you grant; local SQLite tools work without Spark running.
 - **Calendar invites.** Parses `VEVENT` blocks from `.ics` attachments (respects `TZID`, decodes RFC 5545 escapes).
 - **Link extraction.** Splits message links into action/tracking, unsubscribe and other links.
 - **Full-text search.** Uses Spark's own FTS5 indexes for messages (prefix search) and attachment contents.
 - **Categories and digests.** Personal, Notifications and Newsletters; digest for the last 1 to 30 days.
-- **Export.** Messages to PDF (via headless Chrome/Chromium), HTML, TXT or EML; threads to Markdown or PDF.
+- **Export.** Messages to HTML, TXT or EML; threads to Markdown.
 
 ## Requirements
 
 - macOS
 - [Spark Desktop](https://sparkmailapp.com) (the current Spark for Mac, app name "Spark Desktop"), installed and signed in at least once
 - Python 3.9 or newer (`python3 --version`). Install it with `xcode-select --install` or from [python.org](https://www.python.org/downloads/macos/) if missing.
-- Optional: Google Chrome or Chromium for PDF export
 - An MCP client, for example [Claude Desktop](https://claude.ai/download) or [Claude Code](https://docs.claude.com/en/docs/claude-code)
 
 ## Installation
@@ -155,8 +153,8 @@ Ask your assistant, for example:
 
 ### Signatures and export
 - `spark_list_signatures`: active signatures from Spark settings.
-- `spark_export_email`: export a message to PDF, HTML, TXT or EML.
-- `spark_export_thread`: export a thread to Markdown or PDF (default path `~/Downloads/Thread_<id>_<subject>.md`).
+- `spark_export_email`: export a message to HTML, TXT or EML.
+- `spark_export_thread`: export a thread to Markdown (default path `~/Downloads/Thread_<id>_<subject>.md`).
 
 ### Composing and replying
 - `spark_compose_email`: open a new pre-filled message in Spark.
@@ -167,8 +165,7 @@ Ask your assistant, for example:
 - **Sender account.** A `mailto:` link cannot select the sender, so Spark always opens the draft from the default account. Switch the sender in the composer before replying from another mailbox.
 - **Signatures.** Spark does not link signatures to accounts. A reply is signed only when a signature contains the account owner's name.
 - **No sending.** Nothing is sent directly. New emails and replies only open as drafts in Spark.
-- **Attachments.** Only files that Spark has already downloaded to its cache can be found and exported.
-- **PDF export.** Needs Google Chrome or Chromium. Without it, thread export saves HTML and message export fails with an error.
+- **Attachments.** Only files that Spark has already downloaded to its cache can be found and exported. To download an uncached one use `spark_cli_attachment`.
 - **Undocumented format.** The server reads Spark's internal SQLite databases. A Spark update can change their schema and break some tools.
 
 ## Troubleshooting
