@@ -19,12 +19,12 @@ import base64
 import sqlite3
 import shutil
 import time
-import tempfile
 import subprocess
 import urllib.parse
+from contextlib import closing
 from datetime import datetime
 from email.message import EmailMessage
-from email.utils import formatdate
+from email.utils import formatdate, getaddresses
 from html.parser import HTMLParser
 import html
 
@@ -88,15 +88,8 @@ class HTMLToTextParser(HTMLParser):
             self.text_parts.append(data)
 
     def get_text(self):
-        raw = "".join(self.text_parts)
-        lines = [line.strip() for line in raw.splitlines()]
-        cleaned = []
-        for line in lines:
-            if line:
-                cleaned.append(line)
-            elif cleaned and cleaned[-1] != "":
-                cleaned.append("")
-        return "\n".join(cleaned).strip()
+        lines = (line.strip() for line in "".join(self.text_parts).splitlines())
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def format_timestamp(ts):
@@ -111,8 +104,7 @@ def format_timestamp(ts):
 def get_message_body(message_id, format="text"):
     if not os.path.exists(CACHE_DB):
         return None
-    cache_conn = get_ro_conn(CACHE_DB)
-    try:
+    with closing(get_ro_conn(CACHE_DB)) as cache_conn:
         cc = cache_conn.cursor()
         cc.execute("SELECT data FROM messageBodyHtml WHERE messagePk = ?", (message_id,))
         row = cc.fetchone()
@@ -124,15 +116,12 @@ def get_message_body(message_id, format="text"):
             parser.feed(html_raw)
             return parser.get_text()
         return None
-    finally:
-        cache_conn.close()
 
 
 def get_message_parsed_info(message_id):
     if not os.path.exists(CACHE_DB):
         return None, None
-    cache_conn = get_ro_conn(CACHE_DB)
-    try:
+    with closing(get_ro_conn(CACHE_DB)) as cache_conn:
         cc = cache_conn.cursor()
         cc.execute("SELECT data, sourceLanguage FROM messageBodyParsedData WHERE messagePk = ?", (message_id,))
         row = cc.fetchone()
@@ -160,8 +149,6 @@ def get_message_parsed_info(message_id):
             except Exception:
                 pass
         return clean_text, lang
-    finally:
-        cache_conn.close()
 
 
 def find_cached_attachment_file(account_pk, msg_pk, att_name, att_url=None):
@@ -198,14 +185,10 @@ def run_spark_cli(args, timeout=120):
     return res.stdout
 
 
-def download_attachment_via_cli(attachment_pk):
-    """Ask Spark Desktop to download an uncached attachment. Returns the local path."""
-    out = run_spark_cli(["attachment", int(attachment_pk)])
-    m = re.search(r"^\s*Path:\s*(.+?)\s*$", out, re.M)
-    path = m.group(1) if m else None
-    if not path or not os.path.isfile(path):
-        raise RuntimeError(f"Spark CLI gave no usable path: {out.strip()[:300]}")
-    return path
+def check_new_file(path):
+    """Export targets must not exist yet: a model-supplied path must not clobber ~/.zshrc and the like."""
+    if os.path.lexists(path):
+        raise FileExistsError(f"Refusing to overwrite existing file: {path}")
 
 
 def safe_filename(name, fallback):
@@ -216,8 +199,7 @@ def safe_filename(name, fallback):
 
 # Tool implementations
 def spark_list_accounts():
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         c.execute("""
             SELECT pk, accountType, accountTitle, ownerFullName, orderNumber,
@@ -237,13 +219,10 @@ def spark_list_accounts():
                 "type": r["accountType"]
             })
         return accounts
-    finally:
-        conn.close()
 
 
 def spark_get_unread_summary():
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         c.execute("""
             SELECT a.pk as account_id, a.accountTitle, a.ownerFullName,
@@ -267,8 +246,6 @@ def spark_get_unread_summary():
                 "total_messages": r["total_messages"] or 0
             })
         return summary
-    finally:
-        conn.close()
 
 
 def spark_find_unreplied_emails(older_than_days=0, account_id=None, limit=10):
@@ -276,8 +253,7 @@ def spark_find_unreplied_emails(older_than_days=0, account_id=None, limit=10):
     now_ts = int(datetime.now().timestamp())
     cutoff_ts = now_ts - (int(older_than_days) * 86400)
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = [
             "m.inInbox = 1",
@@ -325,13 +301,10 @@ def spark_find_unreplied_emails(older_than_days=0, account_id=None, limit=10):
                 "unseen": bool(r["unseen"])
             })
         return results
-    finally:
-        conn.close()
 
 
 def spark_list_folders(account_id=None):
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         c.execute("""
             SELECT pk, accountPk, folderName, folderPath, imapMessageCount, imapMessageUnseenCount
@@ -351,16 +324,13 @@ def spark_list_folders(account_id=None):
                 "unseen_count": r["imapMessageUnseenCount"]
             })
         return folders
-    finally:
-        conn.close()
 
 
 def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, category=None, limit=20, offset=0):
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = []
         params = []
@@ -408,16 +378,13 @@ def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, cat
                 "date": format_timestamp(r["inboxOrSnoozeDate"] or r["updateDate"])
             })
         return threads
-    finally:
-        conn.close()
 
 
 def spark_list_messages(account_id=None, folder_id=None, category=None, only_inbox=False, only_unseen=False, only_starred=False, limit=10, offset=0):
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = []
         params = []
@@ -475,15 +442,12 @@ def spark_list_messages(account_id=None, folder_id=None, category=None, only_inb
                 "attachments_count": r["numberOfFileAttachments"] or 0
             })
         return messages
-    finally:
-        conn.close()
 
 
 def spark_get_message(message_id, format="text", exclude_quoted_history=False):
     message_id = int(message_id)
 
-    meta_conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as meta_conn:
         mc = meta_conn.cursor()
         mc.execute("""
             SELECT pk, accountPk, conversationPk, receivedDate, creationDate, messageFrom, messageTo,
@@ -514,8 +478,6 @@ def spark_get_message(message_id, format="text", exclude_quoted_history=False):
                 "mime_type": a["attachmentMIMEType"],
                 "cached_path": cached_path
             })
-    finally:
-        meta_conn.close()
 
     clean_unquoted, detected_lang = get_message_parsed_info(message_id)
 
@@ -551,8 +513,7 @@ def spark_get_thread(conversation_id=None, message_id=None, format="text", exclu
     if not conversation_id and not message_id:
         raise ValueError("Either conversation_id or message_id must be provided")
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         if not conversation_id:
             c.execute("SELECT conversationPk FROM messages WHERE pk = ?", (int(message_id),))
@@ -605,13 +566,10 @@ def spark_get_thread(conversation_id=None, message_id=None, format="text", exclu
             "messages_count": len(messages),
             "messages": messages
         }
-    finally:
-        conn.close()
 
 
-def spark_get_attachment(attachment_id=None, message_id=None, filename=None, download=True):
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+def spark_get_attachment(attachment_id=None, message_id=None, filename=None):
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         if attachment_id:
             c.execute("""
@@ -654,35 +612,21 @@ def spark_get_attachment(attachment_id=None, message_id=None, filename=None, dow
         att_url = att["attachmentURL"]
 
         found_path = find_cached_attachment_file(account_pk, msg_pk, att_name, att_url)
-        downloaded, download_error = False, None
-        if not found_path and download:
-            try:
-                found_path = download_attachment_via_cli(att["pk"])
-                downloaded = True
-            except Exception as e:
-                download_error = str(e)
 
-        result = {
+        return {
             "attachment_id": att["pk"],
             "message_id": msg_pk,
             "filename": att_name,
             "size_bytes": att["attachmentSize"],
             "mime_type": att["attachmentMIMEType"],
             "cached_locally": found_path is not None,
-            "downloaded_now": downloaded,
             "file_path": found_path
         }
-        if download_error:
-            result["download_error"] = download_error
-        return result
-    finally:
-        conn.close()
 
 
 def spark_search_attachments(query=None, mime_type=None, limit=20):
     limit = max(1, min(int(limit), 50))
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = []
         params = []
@@ -725,14 +669,11 @@ def spark_search_attachments(query=None, mime_type=None, limit=20):
                 "cached_path": cached_path
             })
         return results
-    finally:
-        conn.close()
 
 
 def spark_find_invoices(query=None, limit=20):
     limit = max(1, min(int(limit), 50))
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = [
             """(
@@ -780,16 +721,13 @@ def spark_find_invoices(query=None, limit=20):
             })
 
         return invoices
-    finally:
-        conn.close()
 
 
 def spark_find_deliveries(days=30, limit=20):
     limit = max(1, min(int(limit), 50))
     since_ts = int(datetime.now().timestamp()) - (int(days) * 86400)
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         sql = """
             SELECT pk as message_id, accountPk, subject, messageFrom, receivedDate, shortBody
@@ -810,7 +748,7 @@ def spark_find_deliveries(days=30, limit=20):
         deliveries = []
         for r in rows:
             m_id = r["message_id"]
-            link_info = spark_extract_links(m_id)
+            link_info = spark_extract_links(m_id, _html=get_message_body(m_id, format="html") or "")
             tracking_links = link_info.get("action_links", [])
 
             # Extract order number patterns
@@ -827,14 +765,11 @@ def spark_find_deliveries(days=30, limit=20):
                 "tracking_links": [l["url"] for l in tracking_links][:3]
             })
         return deliveries
-    finally:
-        conn.close()
 
 
 def spark_list_subscriptions(limit=25):
     limit = max(1, min(int(limit), 100))
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         c.execute("""
             SELECT messageFrom, listUnsubscribeURL, count(*) as count, max(receivedDate) as last_received
@@ -861,14 +796,11 @@ def spark_list_subscriptions(limit=25):
                 "unsubscribe_url": unsub_link
             })
         return subs
-    finally:
-        conn.close()
 
 
 def spark_get_contact_history(email, limit=20):
     limit = max(1, min(int(limit), 50))
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         pattern = f"%{email}%"
 
@@ -911,8 +843,6 @@ def spark_get_contact_history(email, limit=20):
             "last_contact": format_timestamp(stats["last_date"]) if stats else None,
             "recent_messages": messages
         }
-    finally:
-        conn.close()
 
 
 def spark_search_contacts(query, limit=20):
@@ -920,8 +850,7 @@ def spark_search_contacts(query, limit=20):
     if not os.path.exists(CONTACTS_DB):
         return []
 
-    conn = get_ro_conn(CONTACTS_DB)
-    try:
+    with closing(get_ro_conn(CONTACTS_DB)) as conn:
         c = conn.cursor()
         pattern = f"%{query}%"
         c.execute("""
@@ -941,16 +870,13 @@ def spark_search_contacts(query, limit=20):
                 "quality": r["quality"]
             })
         return contacts
-    finally:
-        conn.close()
 
 
 def spark_list_signatures():
     if not os.path.exists(SETTINGS_DB):
         return []
 
-    conn = get_ro_conn(SETTINGS_DB)
-    try:
+    with closing(get_ro_conn(SETTINGS_DB)) as conn:
         c = conn.cursor()
         c.execute("""
             SELECT itemKey, itemValue FROM settings
@@ -965,20 +891,17 @@ def spark_list_signatures():
             try:
                 d = json.loads(val.decode("utf-8", errors="ignore"))
                 if not d.get("deleted"):
-                    html = d.get("htmlContent") or ""
+                    sig_html = d.get("htmlContent") or ""
                     parser = HTMLToTextParser()
-                    parser.feed(html)
-                    plain = parser.get_text()
+                    parser.feed(sig_html)
                     signatures.append({
                         "id": d.get("identifier"),
-                        "text": plain,
-                        "html": html
+                        "text": parser.get_text(),
+                        "html": sig_html
                     })
             except Exception:
                 pass
         return signatures
-    finally:
-        conn.close()
 
 
 def spark_get_digest(days=1, account_id=None, limit=50):
@@ -986,8 +909,7 @@ def spark_get_digest(days=1, account_id=None, limit=50):
     limit = max(1, min(int(limit), 200))
     since_ts = int(datetime.now().timestamp()) - (days * 86400)
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = ["receivedDate >= ?"]
         params = [since_ts]
@@ -1039,37 +961,13 @@ def spark_get_digest(days=1, account_id=None, limit=50):
             digest[cat_name if cat_name in ("personal", "notifications", "newsletters") else "other"].append(item)
 
         return digest
-    finally:
-        conn.close()
 
 
-CHROME_PATHS = (
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-)
-
-
-def html_to_pdf(full_html, out_file):
-    """Print HTML to PDF with headless Chrome. Returns False if no Chrome is installed."""
-    chrome_bin = next((p for p in CHROME_PATHS if os.path.exists(p)), None)
-    if not chrome_bin:
-        return False
-    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as tmp:
-        tmp.write(full_html)
-    try:
-        res = subprocess.run([chrome_bin, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
-                              f"--print-to-pdf={out_file}", tmp.name], capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"Chrome PDF export failed: {res.stderr}")
-        return True
-    finally:
-        os.remove(tmp.name)
-
-
-def spark_export_email(message_id, output_path, format="pdf"):
+def spark_export_email(message_id, output_path, format="html"):
     format_lower = format.lower()
-    msg = spark_get_message(message_id, format="html" if format_lower in ("pdf", "html") else "text")
+    msg = spark_get_message(message_id, format="html" if format_lower == "html" else "text")
     out_file = os.path.expanduser(output_path)
+    check_new_file(out_file)
     os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
 
     if format_lower == "txt":
@@ -1094,11 +992,12 @@ def spark_export_email(message_id, output_path, format="pdf"):
         with open(out_file, "wb") as f:
             f.write(eml.as_bytes())
 
-    elif format_lower in ("html", "pdf"):
+    elif format_lower == "html":
         full_html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; color: #222; }}
 .header {{ border-bottom: 2px solid #e0e0e0; padding-bottom: 16px; margin-bottom: 24px; }}
@@ -1110,10 +1009,10 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helv
 </head>
 <body>
 <div class="header">
-  <h1>{msg['subject']}</h1>
-  <div class="meta-row"><strong>From:</strong> {msg['from']}</div>
-  <div class="meta-row"><strong>To:</strong> {msg['to']}</div>
-  <div class="meta-row"><strong>Date:</strong> {msg['received_date']}</div>
+  <h1>{html.escape(msg['subject'] or '')}</h1>
+  <div class="meta-row"><strong>From:</strong> {html.escape(msg['from'] or '')}</div>
+  <div class="meta-row"><strong>To:</strong> {html.escape(msg['to'] or '')}</div>
+  <div class="meta-row"><strong>Date:</strong> {html.escape(msg['received_date'] or '')}</div>
 </div>
 <div class="body">
 {msg['body']}
@@ -1121,15 +1020,11 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helv
 </body>
 </html>"""
 
-        if format_lower == "html":
-            with open(out_file, "w", encoding="utf-8") as f:
-                f.write(full_html)
-        else:
-            if not html_to_pdf(full_html, out_file):
-                raise RuntimeError("Google Chrome not found for PDF rendering. Export to .html or .txt instead.")
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(full_html)
 
     else:
-        raise ValueError(f"Unsupported format: {format}. Supported: pdf, html, txt, eml")
+        raise ValueError(f"Unsupported format: {format}. Supported: html, txt, eml")
 
     return {
         "status": "exported",
@@ -1155,8 +1050,7 @@ def parse_ics_date(val):
 
 def spark_parse_calendar_invites(message_id=None, limit=10):
     limit = max(1, min(int(limit), 50))
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         where_clauses = ["a.attachmentName LIKE '%.ics'"]
         params = []
@@ -1221,13 +1115,12 @@ def spark_parse_calendar_invites(message_id=None, limit=10):
                 pass
 
         return events
-    finally:
-        conn.close()
 
 
-def spark_extract_links(message_id):
-    msg = spark_get_message(message_id, format="html")
-    html_content = msg.get("body", "")
+def spark_extract_links(message_id, _html=None):
+    # _html: caller already has the HTML body (skips the full spark_get_message).
+    msg = {} if _html is not None else spark_get_message(message_id, format="html")
+    html_content = _html if _html is not None else msg.get("body", "")
 
     link_items = re.findall(r'<a\s+(?:[^>]*?\s+)?href=["\'](https?://[^"\'>]+)["\'][^>]*>(.*?)</a>', html_content, re.IGNORECASE | re.DOTALL)
     seen = set()
@@ -1281,15 +1174,12 @@ def spark_extract_links(message_id):
 
 def spark_reply_to_email(message_id, body, cc=None, bcc=None, auto_signature=True):
     orig = spark_get_message(message_id, format="text", exclude_quoted_history=True)
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         row = conn.execute("""
             SELECT m.messageReplyToMailbox AS reply_to, a.ownerFullName AS owner
             FROM messages m LEFT JOIN accounts a ON a.pk = m.accountPk
             WHERE m.pk = ?
         """, (int(message_id),)).fetchone()
-    finally:
-        conn.close()
     # Replying to our own sent message should go to its recipients, not back to us.
     if orig.get("in_sent"):
         to_addr = orig["to"] or orig["from"]
@@ -1339,8 +1229,7 @@ def spark_list_calendar_events(start_timestamp=None, end_timestamp=None, query=N
     if not os.path.exists(CALENDAR_DB):
         return []
 
-    conn = get_ro_conn(CALENDAR_DB)
-    try:
+    with closing(get_ro_conn(CALENDAR_DB)) as conn:
         c = conn.cursor()
         where_clauses = []
         params = []
@@ -1380,8 +1269,6 @@ def spark_list_calendar_events(start_timestamp=None, end_timestamp=None, query=N
                 "status": r["status"]
             })
         return events
-    finally:
-        conn.close()
 
 
 def spark_search_messages(query, limit=20):
@@ -1392,8 +1279,7 @@ def spark_search_messages(query, limit=20):
 
     if os.path.exists(SEARCH_DB):
         try:
-            fts_conn = get_ro_conn(SEARCH_DB)
-            try:
+            with closing(get_ro_conn(SEARCH_DB)) as fts_conn:
                 fc = fts_conn.cursor()
                 clean_query = "".join(c if c.isalnum() or c.isspace() else " " for c in query).strip()
                 if clean_query:
@@ -1417,14 +1303,11 @@ def spark_search_messages(query, limit=20):
                             "snippet": (r["searchBody"] or "")[:200],
                             "date": format_timestamp(r["receivedDate"])
                         })
-            finally:
-                fts_conn.close()
         except Exception as e:
             sys.stderr.write(f"FTS search fallback due to: {e}\n")
 
     if not results:
-        conn = get_ro_conn(MESSAGES_DB)
-        try:
+        with closing(get_ro_conn(MESSAGES_DB)) as conn:
             c = conn.cursor()
             like_pattern = f"%{query}%"
             c.execute("""
@@ -1444,8 +1327,6 @@ def spark_search_messages(query, limit=20):
                     "snippet": r["shortBody"] or "",
                     "date": format_timestamp(r["receivedDate"])
                 })
-        finally:
-            conn.close()
 
     return results
 
@@ -1461,8 +1342,11 @@ def spark_compose_email(to, subject="", body="", cc="", bcc=""):
     if bcc:
         params["bcc"] = bcc
 
+    # `to` may be "Name <addr>" from a sender-controlled header: keep bare addresses only.
+    to_bare = ",".join(a for _, a in getaddresses([to]) if a)
     query_str = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-    mailto_url = f"mailto:{to}?{query_str}" if query_str else f"mailto:{to}"
+    to_q = urllib.parse.quote(to_bare, safe=",@")
+    mailto_url = f"mailto:{to_q}?{query_str}" if query_str else f"mailto:{to_q}"
 
     res = subprocess.run(["open", "-a", "Spark Desktop", mailto_url], capture_output=True, text=True)
     if res.returncode != 0:
@@ -1491,8 +1375,7 @@ def spark_search_attachment_content(query, limit=20):
         raise FileNotFoundError(f"Messages database not found: {MESSAGES_DB}")
 
     clean_query = query.strip()
-    conn = get_ro_conn(SEARCH_DB)
-    try:
+    with closing(get_ro_conn(SEARCH_DB)) as conn:
         conn.execute(f'ATTACH DATABASE "file:{MESSAGES_DB}?mode=ro" AS msg_db')
         c = conn.cursor()
 
@@ -1537,8 +1420,6 @@ def spark_search_attachment_content(query, limit=20):
                 "cached_file_path": cached_file
             })
         return results
-    finally:
-        conn.close()
 
 
 def spark_get_latest_otp(service=None, max_age_hours=24):
@@ -1549,8 +1430,7 @@ def spark_get_latest_otp(service=None, max_age_hours=24):
     max_age_hours = max(1, min(int(max_age_hours), 168))
     since_ts = int(time.time() - (max_age_hours * 3600))
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         query_clauses = [
             "m.receivedDate >= ?",
@@ -1578,8 +1458,6 @@ def spark_get_latest_otp(service=None, max_age_hours=24):
         """
         c.execute(sql, params)
         candidates = c.fetchall()
-    finally:
-        conn.close()
 
     if not candidates:
         return {"status": "not_found", "message": f"No verification/OTP emails found in past {max_age_hours} hours"}
@@ -1638,17 +1516,15 @@ def spark_get_latest_otp(service=None, max_age_hours=24):
     }
 
 
-def spark_batch_export_attachments(target_dir, file_extension=None, query=None, sender=None, limit=50, download=True):
+def spark_batch_export_attachments(target_dir, file_extension=None, query=None, sender=None, limit=50):
     """
-    Batch export attachments matching filters to a local directory.
-    Uncached ones are downloaded through Spark's CLI when download is true.
+    Batch export cached attachments matching filters to a local directory.
     """
     limit = max(1, min(int(limit), 100))
     dest_dir = os.path.expanduser(target_dir)
     os.makedirs(dest_dir, exist_ok=True)
 
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         c = conn.cursor()
         clauses = []
         params = []
@@ -1680,20 +1556,17 @@ def spark_batch_export_attachments(target_dir, file_extension=None, query=None, 
 
         exported = []
         skipped = 0
-        download_errors = set()
         for r in rows:
             cached_path = find_cached_attachment_file(r["accountPk"], r["messagePk"], r["attachmentName"], r["attachmentURL"])
-            if not cached_path and download:
-                try:
-                    cached_path = download_attachment_via_cli(r["attachmentPk"])
-                except Exception as e:
-                    download_errors.add(str(e))
             if not cached_path or not os.path.exists(cached_path):
                 skipped += 1
                 continue
 
             safe_name = safe_filename(r["attachmentName"], f"file_{r['attachmentPk']}")
             target_file = os.path.join(dest_dir, f"{r['messagePk']}_{safe_name}")
+            if os.path.lexists(target_file):
+                skipped += 1
+                continue
 
             shutil.copy2(cached_path, target_file)
             exported.append({
@@ -1711,16 +1584,13 @@ def spark_batch_export_attachments(target_dir, file_extension=None, query=None, 
             "target_dir": dest_dir,
             "exported_count": len(exported),
             "skipped_count": skipped,
-            "download_errors": sorted(download_errors),
             "files": exported
         }
-    finally:
-        conn.close()
 
 
 def spark_export_thread(conversation_id=None, message_id=None, output_path=None, format="markdown"):
     """
-    Export an entire conversation thread into a structured Markdown or PDF document.
+    Export an entire conversation thread into a structured Markdown document.
     """
     thread = spark_get_thread(conversation_id=conversation_id, message_id=message_id, format="text", exclude_quoted_history=True)
     if not thread or not thread.get("messages"):
@@ -1731,24 +1601,21 @@ def spark_export_thread(conversation_id=None, message_id=None, output_path=None,
     messages = thread.get("messages", [])
 
     # spark_get_thread returns only counts; fetch names for the export.
-    conn = get_ro_conn(MESSAGES_DB)
-    try:
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
         for m in messages:
             if m.get("attachments_count"):
                 rows = conn.execute("SELECT attachmentName FROM messageAttachment WHERE messagePk = ?", (m["message_id"],)).fetchall()
                 m["attachments"] = [{"filename": a["attachmentName"] or ""} for a in rows]
-    finally:
-        conn.close()
 
     safe_subject = re.sub(r'[\\/*?:"<>|]', '_', subject)[:50]
     fmt = format.lower().strip()
 
     if not output_path:
-        ext = "pdf" if fmt == "pdf" else "md"
-        output_path = os.path.expanduser(f"~/Downloads/Thread_{conv_id}_{safe_subject}.{ext}")
+        output_path = os.path.expanduser(f"~/Downloads/Thread_{conv_id}_{safe_subject}.md")
     else:
         output_path = os.path.expanduser(output_path)
 
+    check_new_file(output_path)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     if fmt == "markdown":
@@ -1793,64 +1660,8 @@ def spark_export_thread(conversation_id=None, message_id=None, output_path=None,
             "file_size_bytes": os.path.getsize(output_path)
         }
 
-    elif fmt == "pdf":
-        html_parts = [
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-            f"<title>{html.escape(subject)}</title>",
-            "<style>",
-            "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 30px; color: #222; line-height: 1.5; }",
-            ".header { border-bottom: 2px solid #0066cc; padding-bottom: 12px; margin-bottom: 24px; }",
-            ".msg { margin-bottom: 30px; padding: 18px; border: 1px solid #e1e4e8; border-radius: 8px; background: #fff; page-break-inside: avoid; }",
-            ".meta { font-size: 13px; color: #586069; margin-bottom: 12px; }",
-            ".meta strong { color: #24292e; }",
-            ".body { white-space: pre-wrap; font-size: 14px; color: #24292e; }",
-            "</style></head><body>",
-            f"<div class='header'><h2>{html.escape(subject)}</h2>",
-            f"<p>Conversation ID: <code>{conv_id}</code> | Messages: {len(messages)} | Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p></div>"
-        ]
-        for idx, m in enumerate(messages, 1):
-            att_html = ""
-            if m.get("attachments"):
-                att_list = ", ".join(html.escape(a.get("filename", "")) for a in m.get("attachments"))
-                att_html = f"<div><strong>Attachments:</strong> {att_list}</div>"
-            html_parts.append(
-                f"<div class='msg'>"
-                f"<h4>#{idx} - {html.escape(m.get('subject') or '')}</h4>"
-                f"<div class='meta'>"
-                f"<div><strong>From:</strong> {html.escape(m.get('from') or '')}</div>"
-                f"<div><strong>To:</strong> {html.escape(m.get('to') or '')}</div>"
-                f"<div><strong>Date:</strong> {html.escape(m.get('date') or '')}</div>"
-                f"{att_html}"
-                f"</div>"
-                f"<div class='body'>{html.escape((m.get('body') or '').strip())}</div>"
-                f"</div>"
-            )
-        html_parts.append("</body></html>")
-        full_html = "".join(html_parts)
-
-        if not html_to_pdf(full_html, output_path):
-            html_path = output_path.replace(".pdf", ".html")
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(full_html)
-            return {
-                "status": "success",
-                "format": "html",
-                "file_path": html_path,
-                "conversation_id": conv_id,
-                "message_count": len(messages),
-                "note": "Chrome not found for PDF printing; saved as HTML."
-            }
-
-        return {
-            "status": "success",
-            "format": "pdf",
-            "file_path": output_path,
-            "conversation_id": conv_id,
-            "message_count": len(messages),
-            "file_size_bytes": os.path.getsize(output_path)
-        }
     else:
-        raise ValueError(f"Unsupported format: {format}. Choose 'markdown' or 'pdf'")
+        raise ValueError(f"Unsupported format: {format}. Only 'markdown' is supported")
 
 
 # MCP Server Definitions
@@ -2016,14 +1827,13 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_get_attachment",
-        "description": "Locate an attachment file on disk and inspect details. If Spark has not cached it yet, downloads it via Spark's bundled CLI (needs Spark running and Settings > AI Agents enabled).",
+        "description": "Locate an attachment file from Spark's local cache on disk and inspect details. To download an uncached one use spark_cli_attachment.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "attachment_id": {"type": "integer", "description": "ID of the attachment from spark_get_message or spark_search_attachments."},
                 "message_id": {"type": "integer", "description": "Message ID containing the attachment."},
-                "filename": {"type": "string", "description": "Name or part of filename of the attachment."},
-                "download": {"type": "boolean", "description": "Download the file through Spark if not cached (default true).", "default": True}
+                "filename": {"type": "string", "description": "Name or part of filename of the attachment."}
             }
         }
     },
@@ -2041,18 +1851,18 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_export_email",
-        "description": "Export an email to a file on disk (formats: pdf, html, txt, eml).",
+        "description": "Export an email to a file on disk (formats: html, txt, eml).",
         "inputSchema": {
             "type": "object",
             "required": ["message_id", "output_path"],
             "properties": {
                 "message_id": {"type": "integer", "description": "ID of the email to export."},
-                "output_path": {"type": "string", "description": "Destination file path (e.g. ~/Desktop/invoice.pdf)."},
+                "output_path": {"type": "string", "description": "Destination file path (e.g. ~/Desktop/invoice.html)."},
                 "format": {
                     "type": "string",
-                    "enum": ["pdf", "html", "txt", "eml"],
-                    "description": "Export file format (default 'pdf').",
-                    "default": "pdf"
+                    "enum": ["html", "txt", "eml"],
+                    "description": "Export file format (default 'html').",
+                    "default": "html"
                 }
             }
         }
@@ -2201,7 +2011,7 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_batch_export_attachments",
-        "description": "Batch export attachments matching filters (file extension, sender, search term) to a local directory. Uncached files are downloaded through Spark's CLI.",
+        "description": "Batch export cached attachments matching filters (file extension, sender, search term) to a local directory.",
         "inputSchema": {
             "type": "object",
             "required": ["target_dir"],
@@ -2210,21 +2020,20 @@ TOOLS_SCHEMA = [
                 "file_extension": {"type": "string", "description": "Optional file extension to filter by (e.g. 'pdf', 'xlsx', 'docx')."},
                 "query": {"type": "string", "description": "Optional search term to filter attachment name or email subject."},
                 "sender": {"type": "string", "description": "Optional sender name or email address."},
-                "limit": {"type": "integer", "description": "Maximum number of files to export (default 50).", "default": 50},
-                "download": {"type": "boolean", "description": "Download uncached files through Spark (default true).", "default": True}
+                "limit": {"type": "integer", "description": "Maximum number of files to export (default 50).", "default": 50}
             }
         }
     },
     {
         "name": "spark_export_thread",
-        "description": "Export an entire conversation thread into a structured Markdown or PDF document.",
+        "description": "Export an entire conversation thread into a structured Markdown document.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "conversation_id": {"type": "integer", "description": "Thread conversation ID."},
                 "message_id": {"type": "integer", "description": "Message ID (used to lookup conversation ID if conversation_id omitted)."},
-                "output_path": {"type": "string", "description": "Optional output file path (defaults to ~/Downloads/Thread_<id>.md or .pdf)."},
-                "format": {"type": "string", "description": "Output format: 'markdown' (default) or 'pdf'.", "enum": ["markdown", "pdf"], "default": "markdown"}
+                "output_path": {"type": "string", "description": "Optional output file path (defaults to ~/Downloads/Thread_<id>_<subject>.md)."},
+                "format": {"type": "string", "description": "Output format: only 'markdown'.", "enum": ["markdown"], "default": "markdown"}
             }
         }
     }
@@ -2238,11 +2047,20 @@ CLI_CATALOG = {}  # tool name -> catalog entry; filled by refresh_cli_catalog()
 CLI_OUTPUT_LIMIT = 30000
 
 
-def refresh_cli_catalog():
-    """(Re)load `spark tools`. Leaves the catalog empty when Spark is not running."""
+_cli_tried_at = 0.0
+
+
+def refresh_cli_catalog(max_age=300):
+    """(Re)load `spark tools`, at most once per max_age seconds (30 while the catalog is empty).
+    Leaves the catalog empty when Spark is not running."""
+    global _cli_tried_at
+    if time.time() - _cli_tried_at < (max_age if CLI_CATALOG else min(max_age, 30)):
+        return
+    _cli_tried_at = time.time()
     try:
         tools = json.loads(run_spark_cli(["tools"], timeout=15))["tools"]
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"Spark CLI catalog not loaded: {e}\n")
         return
     CLI_CATALOG.clear()
     CLI_CATALOG.update({"spark_cli_" + t["command"].replace("-", "_"): t for t in tools})
@@ -2251,17 +2069,20 @@ def refresh_cli_catalog():
 def cli_tool_schemas():
     schemas = []
     for name, t in CLI_CATALOG.items():
-        props = {}
-        for p in t["parameters"]:
-            prop = {"type": p["type"], "description": p.get("description", "")}
-            if p["type"] == "array":
-                prop["items"] = p.get("items", {"type": "string"})
-            props[p["name"]] = prop
-        schema = {"type": "object", "properties": props}
-        required = [p["name"] for p in t["parameters"] if p.get("required")]
-        if required:
-            schema["required"] = required
-        schemas.append({"name": name, "description": t["description"] + " (via Spark CLI)", "inputSchema": schema})
+        try:  # one malformed catalog entry must not take down tools/list
+            props = {}
+            for p in t["parameters"]:
+                prop = {"type": p["type"], "description": p.get("description", "")}
+                if p["type"] == "array":
+                    prop["items"] = p.get("items", {"type": "string"})
+                props[p["name"]] = prop
+            schema = {"type": "object", "properties": props}
+            required = [p["name"] for p in t["parameters"] if p.get("required")]
+            if required:
+                schema["required"] = required
+            schemas.append({"name": name, "description": t["description"] + " (via Spark CLI)", "inputSchema": schema})
+        except Exception as e:
+            sys.stderr.write(f"Skipping malformed Spark CLI tool {name}: {e}\n")
     return schemas
 
 
@@ -2272,14 +2093,6 @@ def call_cli_tool(name, kw):
     if unknown:
         raise ValueError(f"Unknown arguments: {sorted(unknown)}")
     args = [t["command"]]
-    for p in t["parameters"]:  # positionals first, in catalog order
-        v = kw.get(p["name"])
-        if "flag" not in p:
-            if v in (None, "", []):
-                if p.get("required"):
-                    raise ValueError(f"Missing required argument: {p['name']}")
-            else:
-                args.extend(v if isinstance(v, list) else [v])
     for p in t["parameters"]:
         v = kw.get(p["name"])
         if "flag" not in p or v is None:
@@ -2290,6 +2103,21 @@ def call_cli_tool(name, kw):
         else:
             for item in (v if isinstance(v, list) else [v]):
                 args.extend([p["flag"], item])
+    positionals, gap = [], None  # `--` below keeps values starting with "-" from being parsed as options
+    for p in t["parameters"]:
+        if "flag" in p:
+            continue
+        v = kw.get(p["name"])
+        if v in (None, "", []):
+            if p.get("required"):
+                raise ValueError(f"Missing required argument: {p['name']}")
+            gap = gap or p["name"]
+        else:
+            if gap:
+                raise ValueError(f"Argument {p['name']} needs {gap} to be set first")
+            positionals.extend(v if isinstance(v, list) else [v])
+    if positionals:
+        args.extend(["--"] + positionals)
     out = run_spark_cli(args).rstrip()
     if len(out) > CLI_OUTPUT_LIMIT:  # e.g. `search <query>` returns 20 full bodies
         out = out[:CLI_OUTPUT_LIMIT] + f"\n\n[truncated: {len(out)} chars total. Narrow the query/filter or use a smaller page_size.]"
@@ -2332,12 +2160,17 @@ def handle_request(req):
         }
 
     if method == "tools/list":
-        refresh_cli_catalog()
+        try:
+            refresh_cli_catalog()
+            cli_tools = cli_tool_schemas()
+        except Exception as e:
+            sys.stderr.write(f"Spark CLI tools unavailable: {e}\n")
+            cli_tools = []
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "tools": TOOLS_SCHEMA + cli_tool_schemas()
+                "tools": TOOLS_SCHEMA + cli_tools
             }
         }
 
@@ -2351,7 +2184,7 @@ def handle_request(req):
                 res = globals()[tool_name](**args)
             else:
                 if tool_name not in CLI_CATALOG:
-                    refresh_cli_catalog()
+                    refresh_cli_catalog(max_age=30)
                 if tool_name not in CLI_CATALOG:
                     raise ValueError(f"Unknown tool: {tool_name} (Spark CLI tools need Spark running)")
                 res = call_cli_tool(tool_name, args)
@@ -2402,6 +2235,7 @@ def main():
         line = line.strip()
         if not line:
             continue
+        req = None
         try:
             req = json.loads(line)
             resp = handle_request(req)
@@ -2411,6 +2245,10 @@ def main():
         except Exception as e:
             sys.stderr.write(f"Protocol error: {e}\n")
             sys.stderr.flush()
+            if isinstance(req, dict) and "id" in req:  # never leave a request unanswered
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                             "error": {"code": -32603, "message": str(e)}}) + "\n")
+                sys.stdout.flush()
 
 
 if __name__ == "__main__":
