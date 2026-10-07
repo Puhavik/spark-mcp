@@ -34,7 +34,31 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 - Python 3.9 or newer (`python3 --version`). Install it with `xcode-select --install` or from [python.org](https://www.python.org/downloads/macos/) if missing.
 - An MCP client, for example [Claude Desktop](https://claude.ai/download) or [Claude Code](https://docs.claude.com/en/docs/claude-code)
 
-## Installation
+## Quick Installation (1-Step Auto Install)
+
+Run this one-liner in Terminal to download and auto-configure Spark MCP for Claude Desktop, Cursor, and Antigravity:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Puhavik/spark-mcp/main/spark_mcp.py -o ~/spark_mcp.py && python3 ~/spark_mcp.py --install
+```
+
+Or if you clone the repo:
+
+```bash
+git clone https://github.com/Puhavik/spark-mcp.git ~/spark-mcp
+python3 ~/spark-mcp/spark_mcp.py --install
+```
+
+Restart Claude Desktop (Cmd+Q) and the tools will appear immediately in your chat!
+
+To remove:
+```bash
+python3 ~/spark-mcp/spark_mcp.py --uninstall
+```
+
+---
+
+## Manual Installation
 
 ### 1. Get the script
 

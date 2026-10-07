@@ -2677,7 +2677,166 @@ def handle_request(req):
     }
 
 
+def install_mcp():
+    """Auto-configure spark-mail MCP server into installed AI clients on macOS."""
+    python_bin = sys.executable
+    script_path = os.path.abspath(__file__)
+    server_entry = {
+        "command": python_bin,
+        "args": [script_path]
+    }
+
+    installed = []
+
+    # 1. Claude Desktop
+    claude_cfg = os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json")
+    if os.path.isdir(os.path.dirname(claude_cfg)):
+        try:
+            data = {}
+            if os.path.exists(claude_cfg):
+                shutil.copy2(claude_cfg, claude_cfg + ".bak")
+                with open(claude_cfg, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data.setdefault("mcpServers", {})["spark-mail"] = server_entry
+            with open(claude_cfg, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            installed.append("Claude Desktop (restart with Cmd+Q)")
+        except Exception as e:
+            sys.stderr.write(f"Failed to configure Claude Desktop: {e}\n")
+
+    # 2. Antigravity
+    ag_cfg = os.path.expanduser("~/.gemini/antigravity/mcp_config.json")
+    if os.path.isdir(os.path.dirname(ag_cfg)):
+        try:
+            data = {}
+            if os.path.exists(ag_cfg):
+                shutil.copy2(ag_cfg, ag_cfg + ".bak")
+                with open(ag_cfg, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data.setdefault("mcpServers", {})["spark-mail"] = server_entry
+            with open(ag_cfg, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            installed.append("Antigravity")
+        except Exception as e:
+            sys.stderr.write(f"Failed to configure Antigravity: {e}\n")
+
+    # 3. Cursor
+    cursor_dir = os.path.expanduser("~/.cursor")
+    cursor_cfg = os.path.join(cursor_dir, "mcp.json")
+    if os.path.exists(cursor_dir):
+        try:
+            data = {}
+            if os.path.exists(cursor_cfg):
+                shutil.copy2(cursor_cfg, cursor_cfg + ".bak")
+                with open(cursor_cfg, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data.setdefault("mcpServers", {})["spark-mail"] = server_entry
+            with open(cursor_cfg, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            installed.append("Cursor")
+        except Exception as e:
+            sys.stderr.write(f"Failed to configure Cursor: {e}\n")
+
+    # 4. Claude Code CLI
+    if shutil.which("claude"):
+        try:
+            subprocess.run(
+                ["claude", "mcp", "add", "spark-mail", "--scope", "user", "--", python_bin, script_path],
+                check=True, capture_output=True, text=True
+            )
+            installed.append("Claude Code CLI")
+        except Exception as e:
+            pass
+
+    if installed:
+        print("✓ Successfully configured spark-mail MCP server for:")
+        for item in installed:
+            print(f"  • {item}")
+        print(f"\nCommand: {python_bin}")
+        print(f"Script:  {script_path}")
+    else:
+        print("No supported AI client configurations found on this Mac.")
+
+
+def uninstall_mcp():
+    """Remove spark-mail MCP server from installed AI clients on macOS."""
+    removed = []
+
+    # Claude Desktop
+    claude_cfg = os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json")
+    if os.path.exists(claude_cfg):
+        try:
+            with open(claude_cfg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "mcpServers" in data and "spark-mail" in data["mcpServers"]:
+                del data["mcpServers"]["spark-mail"]
+                with open(claude_cfg, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                removed.append("Claude Desktop")
+        except Exception as e:
+            sys.stderr.write(f"Failed to update Claude Desktop: {e}\n")
+
+    # Antigravity
+    ag_cfg = os.path.expanduser("~/.gemini/antigravity/mcp_config.json")
+    if os.path.exists(ag_cfg):
+        try:
+            with open(ag_cfg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "mcpServers" in data and "spark-mail" in data["mcpServers"]:
+                del data["mcpServers"]["spark-mail"]
+                with open(ag_cfg, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                removed.append("Antigravity")
+        except Exception as e:
+            sys.stderr.write(f"Failed to update Antigravity: {e}\n")
+
+    # Cursor
+    cursor_cfg = os.path.expanduser("~/.cursor/mcp.json")
+    if os.path.exists(cursor_cfg):
+        try:
+            with open(cursor_cfg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "mcpServers" in data and "spark-mail" in data["mcpServers"]:
+                del data["mcpServers"]["spark-mail"]
+                with open(cursor_cfg, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                removed.append("Cursor")
+        except Exception as e:
+            sys.stderr.write(f"Failed to update Cursor: {e}\n")
+
+    # Claude Code
+    if shutil.which("claude"):
+        try:
+            subprocess.run(["claude", "mcp", "remove", "spark-mail"], capture_output=True)
+            removed.append("Claude Code CLI")
+        except Exception:
+            pass
+
+    if removed:
+        print("✓ Successfully removed spark-mail from:")
+        for item in removed:
+            print(f"  • {item}")
+    else:
+        print("spark-mail configuration not found.")
+
+
 def main():
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].lower()
+        if cmd in ("--install", "-i", "install"):
+            install_mcp()
+            return
+        if cmd in ("--uninstall", "-u", "uninstall"):
+            uninstall_mcp()
+            return
+        if cmd in ("--help", "-h", "help"):
+            print("Spark Desktop MCP Server")
+            print("Usage:")
+            print("  python3 spark_mcp.py             Run MCP stdio server")
+            print("  python3 spark_mcp.py --install   Auto-configure into Claude Desktop, Cursor, Antigravity")
+            print("  python3 spark_mcp.py --uninstall Remove from all AI clients")
+            return
+
     while True:
         line = sys.stdin.readline()
         if not line:
