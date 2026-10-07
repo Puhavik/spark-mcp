@@ -21,8 +21,11 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 - **Calendar invites.** Parses `VEVENT` blocks from `.ics` attachments (respects `TZID`, decodes RFC 5545 escapes).
 - **Link extraction.** Splits message links into action/tracking, unsubscribe and other links.
 - **Full-text search.** Uses Spark's own FTS5 indexes for messages (prefix search) and attachment contents.
-- **Categories and digests.** Personal, Notifications and Newsletters; digest for the last 1 to 30 days.
-- **Export.** Messages to HTML, TXT or EML; threads to Markdown.
+- **Document inspection (PDF, DOCX, XLSX, Images).** Reads PDF, Word (.docx), Excel (.xlsx), images and text attachments entirely in RAM with zero external dependencies (pure Python standard library).
+- **Prompt injection defense.** Automatically strips zero-width invisible Unicode characters, bidi overrides, and malicious formatting from untrusted incoming emails.
+- **Tool surface restriction (`SPARK_EXPOSED_TOOLS`).** Configurable tool exposure (`all`, `read-only`, `read-only+spark_compose_email`, or `core`) to protect against unauthorized writes and save thousands of tokens in Claude's context window.
+- **Safe export directory jailing.** Exports default to and are strictly jailed inside `~/Downloads` (customizable via `SPARK_ALLOWED_ROOTS`), preventing directory traversal.
+- **Export.** Messages to HTML, TXT or EML; threads to Markdown (jailed to `~/Downloads`).
 
 ## Requirements
 

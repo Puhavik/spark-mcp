@@ -22,6 +22,9 @@ import shutil
 import time
 import subprocess
 import urllib.parse
+import unicodedata
+import zipfile
+import xml.etree.ElementTree as ET
 from contextlib import closing
 from datetime import datetime
 from email.message import EmailMessage
@@ -41,6 +44,119 @@ SETTINGS_DB = os.path.join(SPARK_CORE_DATA, "settings.sqlite")
 # authorizes calls made through it, not the SparklyRemote binary inside the .app.
 SPARK_CLI = next((p for p in ("/usr/local/bin/spark", "/opt/homebrew/bin/spark") if os.path.exists(p)),
                  "/usr/local/bin/spark")
+
+# Export directories jail: default is ~/Downloads
+SPARK_ALLOWED_ROOTS = [os.path.realpath(os.path.expanduser("~/Downloads"))]
+_env_roots = os.getenv("SPARK_ALLOWED_ROOTS")
+if _env_roots:
+    for _r in _env_roots.split(","):
+        _r = _r.strip()
+        if _r:
+            SPARK_ALLOWED_ROOTS.append(os.path.realpath(os.path.expanduser(_r)))
+
+
+def validate_safe_export_path(path):
+    """Ensure export destination path is jailed within allowed roots (default ~/Downloads)."""
+    real = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    if not any(real == root or real.startswith(root + os.sep) for root in SPARK_ALLOWED_ROOTS):
+        roots_str = ", ".join(SPARK_ALLOWED_ROOTS)
+        raise PermissionError(
+            f"Path '{path}' is outside allowed export directories: [{roots_str}]. Allowed default is ~/Downloads."
+        )
+    return real
+
+
+# Prompt injection & invisible Unicode sanitizer
+_INVISIBLE_CHARS = re.compile(
+    "["
+    "\u200b"  # zero-width space
+    "\u200c"  # zero-width non-joiner
+    "\u200d"  # zero-width joiner
+    "\u200e"  # left-to-right mark
+    "\u200f"  # right-to-left mark
+    "\u2028"  # line separator
+    "\u2029"  # paragraph separator
+    "\u202a-\u202e"  # bidi embedding/override
+    "\u2060"  # word joiner
+    "\u2061-\u2064"  # invisible operators
+    "\ufeff"  # zero width no-break space / BOM
+    "\ufff9-\ufffb"  # interlinear annotations
+    "]"
+)
+_EXCESSIVE_NEWLINES = re.compile(r"\n{3,}")
+
+
+def sanitize_user_content(text, max_length=None):
+    """Sanitize untrusted user/email content: strip invisible characters, control chars, and excessive newlines."""
+    if not text:
+        return ""
+    cleaned = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat in ("Cc", "Cf"):
+            if ch in ("\n", "\r", "\t"):
+                cleaned.append(ch)
+            # drop unprintable control characters
+        else:
+            cleaned.append(ch)
+    result = "".join(cleaned)
+    result = _INVISIBLE_CHARS.sub("", result)
+    result = _EXCESSIVE_NEWLINES.sub("\n\n", result)
+    result = result.strip()
+    if max_length and len(result) > max_length:
+        result = result[:max_length] + " ...[truncated]"
+    return result
+
+
+# Tool Exposure Profiles
+MUTATING_TOOLS = {
+    "spark_compose_email",
+    "spark_reply_to_email",
+    "spark_export_email",
+    "spark_export_thread",
+    "spark_batch_export_attachments",
+    "spark_cli_action",
+    "spark_cli_draft",
+    "spark_cli_event",
+    "spark_cli_comment",
+    "spark_cli_contact_action",
+}
+
+CORE_TOOLS = {
+    "spark_list_accounts",
+    "spark_get_unread_summary",
+    "spark_list_threads",
+    "spark_list_messages",
+    "spark_get_message",
+    "spark_get_thread",
+    "spark_search_messages",
+    "spark_inspect_attachment",
+    "spark_inspect_document",
+    "inspect_document",
+    "spark_find_invoices",
+    "spark_compose_email",
+    "spark_reply_to_email",
+}
+
+
+def is_tool_exposed(name):
+    """Check if tool is allowed under SPARK_EXPOSED_TOOLS environment variable."""
+    raw = os.getenv("SPARK_EXPOSED_TOOLS", "all").strip().lower()
+    if raw == "all" or not raw:
+        return True
+    if raw == "core":
+        return name in CORE_TOOLS
+    if raw.startswith("read-only"):
+        extra = set()
+        if "+" in raw:
+            _, plus = raw.split("+", 1)
+            extra = {t.strip() for t in plus.split(",") if t.strip()}
+        if name.lower() in extra:
+            return True
+        return name not in MUTATING_TOOLS
+    allowed = {t.strip() for t in raw.split(",") if t.strip()}
+    return name.lower() in allowed
+
 
 CATEGORY_MAP = {
     0: "other",
@@ -90,7 +206,8 @@ class HTMLToTextParser(HTMLParser):
 
     def get_text(self):
         lines = (line.strip() for line in "".join(self.text_parts).splitlines())
-        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+        raw = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+        return sanitize_user_content(raw)
 
 
 def format_timestamp(ts):
@@ -146,7 +263,7 @@ def get_message_parsed_info(message_id):
                                 decoded = base64.b64decode(b64_str).decode("utf-8", errors="ignore")
                                 text_parts.append(decoded.strip())
                     if text_parts:
-                        clean_text = "\n\n".join(text_parts)
+                        clean_text = sanitize_user_content("\n\n".join(text_parts))
             except Exception:
                 pass
         return clean_text, lang
@@ -187,7 +304,8 @@ def run_spark_cli(args, timeout=120):
 
 
 def check_new_file(path):
-    """Export targets must not exist yet: a model-supplied path must not clobber ~/.zshrc and the like."""
+    """Export targets must stay within allowed roots (default ~/Downloads) and not exist yet."""
+    validate_safe_export_path(path)
     if os.path.lexists(path):
         raise FileExistsError(f"Refusing to overwrite existing file: {path}")
 
@@ -434,8 +552,8 @@ def spark_list_messages(account_id=None, folder_id=None, category=None, only_inb
                 "date": format_timestamp(r["receivedDate"]),
                 "from": r["messageFrom"],
                 "to": r["messageTo"],
-                "subject": r["subject"] or "",
-                "snippet": r["shortBody"] or "",
+                "subject": sanitize_user_content(r["subject"] or ""),
+                "snippet": sanitize_user_content(r["shortBody"] or ""),
                 "category": CATEGORY_MAP.get(cat_val, "other"),
                 "unseen": bool(r["unseen"]),
                 "starred": bool(r["starred"]),
@@ -498,7 +616,7 @@ def spark_get_message(message_id, format="text", exclude_quoted_history=False):
         "to": msg["messageTo"],
         "cc": msg["messageCc"],
         "bcc": msg["messageBcc"],
-        "subject": msg["subject"] or "",
+        "subject": sanitize_user_content(msg["subject"] or ""),
         "category": CATEGORY_MAP.get(msg["category"], "other"),
         "detected_language": detected_lang,
         "body": body,
@@ -789,7 +907,85 @@ def spark_inspect_attachment(attachment_id=None, message_id=None, filename=None,
                 "does not contain a text layer (possibly a scanned image without OCR)."
             )
 
-        # 3. If this is a text file (TXT, CSV, JSON, MD, LOG, XML, HTML, ICS, etc.)
+        # 3. If this is a Word document (.docx)
+        if ext == ".docx" or mime_type in {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword"
+        }:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    xml_content = z.read("word/document.xml")
+                root = ET.fromstring(xml_content)
+                del xml_content
+                del data
+                paragraphs = []
+                for p in root.iter():
+                    if p.tag.endswith("}p"):
+                        texts = [node.text for node in p.iter() if node.tag.endswith("}t") and node.text]
+                        if texts:
+                            paragraphs.append("".join(texts))
+                full_text = "\n\n".join(paragraphs).strip()
+                if full_text:
+                    return f"Contents of Word document '{att_name}':\n\n{sanitize_user_content(full_text)}"
+                return f"Word document '{att_name}' does not contain readable text."
+            except Exception as e:
+                return f"Error reading Word document '{att_name}': {e}"
+
+        # 4. If this is an Excel spreadsheet (.xlsx)
+        if ext == ".xlsx" or mime_type in {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel"
+        }:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    shared_strings = []
+                    if "xl/sharedStrings.xml" in z.namelist():
+                        sst_root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                        for si in sst_root.iter():
+                            if si.tag.endswith("}si"):
+                                t_nodes = [node.text for node in si.iter() if node.tag.endswith("}t") and node.text]
+                                shared_strings.append("".join(t_nodes))
+
+                    sheet_name = "xl/worksheets/sheet1.xml"
+                    if sheet_name not in z.namelist():
+                        sheets = [n for n in z.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+                        sheet_name = sheets[0] if sheets else None
+
+                    if not sheet_name:
+                        return f"Spreadsheet '{att_name}' contains no readable worksheets."
+
+                    sheet_root = ET.fromstring(z.read(sheet_name))
+                del data
+
+                rows_text = []
+                for row in sheet_root.iter():
+                    if row.tag.endswith("}row"):
+                        cells = []
+                        for c in row.iter():
+                            if c.tag.endswith("}c"):
+                                cell_type = c.get("t")
+                                val_node = next((n for n in c if n.tag.endswith("}v")), None)
+                                val = val_node.text if val_node is not None and val_node.text else ""
+                                if cell_type == "s" and val.isdigit():
+                                    idx = int(val)
+                                    val = shared_strings[idx] if idx < len(shared_strings) else val
+                                elif cell_type == "inlineStr":
+                                    is_t = next((n for n in c.iter() if n.tag.endswith("}t") and n.text), None)
+                                    val = is_t.text if is_t else val
+                                cells.append(val.strip())
+                        if any(cells):
+                            rows_text.append(" | ".join(cells))
+
+                if rows_text:
+                    full_text = "\n".join(rows_text[:200])
+                    if len(rows_text) > 200:
+                        full_text += f"\n\n[... {len(rows_text) - 200} more rows truncated]"
+                    return f"Contents of spreadsheet '{att_name}' ({len(rows_text)} rows):\n\n{sanitize_user_content(full_text)}"
+                return f"Spreadsheet '{att_name}' is empty."
+            except Exception as e:
+                return f"Error reading spreadsheet '{att_name}': {e}"
+
+        # 5. If this is a text file (TXT, CSV, JSON, MD, LOG, XML, HTML, ICS, etc.)
         if (
             mime_type.startswith("text/")
             or ext in {
@@ -804,7 +1000,7 @@ def spark_inspect_attachment(attachment_id=None, message_id=None, filename=None,
             except UnicodeDecodeError:
                 text_content = data.decode("latin-1", errors="replace")
             del data
-            return text_content
+            return sanitize_user_content(text_content)
 
         del data
         return (
@@ -1156,10 +1352,15 @@ def spark_get_digest(days=1, account_id=None, limit=50):
         return digest
 
 
-def spark_export_email(message_id, output_path, format="html"):
+def spark_export_email(message_id, output_path=None, format="html"):
     format_lower = format.lower()
     msg = spark_get_message(message_id, format="html" if format_lower == "html" else "text")
-    out_file = os.path.expanduser(output_path)
+    if not output_path:
+        out_file = os.path.join(SPARK_ALLOWED_ROOTS[0], f"Email_{message_id}.{format_lower}")
+    elif not os.path.isabs(os.path.expanduser(output_path)):
+        out_file = os.path.join(SPARK_ALLOWED_ROOTS[0], output_path)
+    else:
+        out_file = os.path.expanduser(output_path)
     check_new_file(out_file)
     os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
 
@@ -1709,12 +1910,18 @@ def spark_get_latest_otp(service=None, max_age_hours=24):
     }
 
 
-def spark_batch_export_attachments(target_dir, file_extension=None, query=None, sender=None, limit=50):
+def spark_batch_export_attachments(target_dir=None, file_extension=None, query=None, sender=None, limit=50):
     """
-    Batch export cached attachments matching filters to a local directory.
+    Batch export cached attachments matching filters to a local directory (jailed to allowed roots).
     """
     limit = max(1, min(int(limit), 100))
-    dest_dir = os.path.expanduser(target_dir)
+    if not target_dir:
+        dest_dir = SPARK_ALLOWED_ROOTS[0]
+    elif not os.path.isabs(os.path.expanduser(target_dir)):
+        dest_dir = os.path.join(SPARK_ALLOWED_ROOTS[0], target_dir)
+    else:
+        dest_dir = os.path.expanduser(target_dir)
+    validate_safe_export_path(dest_dir)
     os.makedirs(dest_dir, exist_ok=True)
 
     with closing(get_ro_conn(MESSAGES_DB)) as conn:
@@ -1804,7 +2011,9 @@ def spark_export_thread(conversation_id=None, message_id=None, output_path=None,
     fmt = format.lower().strip()
 
     if not output_path:
-        output_path = os.path.expanduser(f"~/Downloads/Thread_{conv_id}_{safe_subject}.md")
+        output_path = os.path.join(SPARK_ALLOWED_ROOTS[0], f"Thread_{conv_id}_{safe_subject}.md")
+    elif not os.path.isabs(os.path.expanduser(output_path)):
+        output_path = os.path.join(SPARK_ALLOWED_ROOTS[0], output_path)
     else:
         output_path = os.path.expanduser(output_path)
 
@@ -2080,13 +2289,13 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_export_email",
-        "description": "Export an email to a file on disk (formats: html, txt, eml).",
+        "description": "Export an email to a file on disk (formats: html, txt, eml). Default path is ~/Downloads.",
         "inputSchema": {
             "type": "object",
-            "required": ["message_id", "output_path"],
+            "required": ["message_id"],
             "properties": {
                 "message_id": {"type": "integer", "description": "ID of the email to export."},
-                "output_path": {"type": "string", "description": "Destination file path (e.g. ~/Desktop/invoice.html)."},
+                "output_path": {"type": "string", "description": "Destination file path within ~/Downloads (default ~/Downloads/Email_<id>.<format>)."},
                 "format": {
                     "type": "string",
                     "enum": ["html", "txt", "eml"],
@@ -2395,11 +2604,13 @@ def handle_request(req):
         except Exception as e:
             sys.stderr.write(f"Spark CLI tools unavailable: {e}\n")
             cli_tools = []
+        all_tools = TOOLS_SCHEMA + cli_tools
+        exposed_tools = [t for t in all_tools if is_tool_exposed(t["name"])]
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "tools": TOOLS_SCHEMA + cli_tools
+                "tools": exposed_tools
             }
         }
 
@@ -2408,6 +2619,9 @@ def handle_request(req):
         args = params.get("arguments", {})
 
         try:
+            if not is_tool_exposed(tool_name):
+                raise PermissionError(f"Tool '{tool_name}' is disabled by SPARK_EXPOSED_TOOLS.")
+
             # Schema names are the allowlist; argument defaults live on the functions.
             if tool_name in TOOL_NAMES:
                 res = globals()[tool_name](**args)
