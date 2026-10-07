@@ -129,6 +129,7 @@ Ask your assistant, for example:
 - `spark_get_thread`: all messages of a thread by `conversation_id` or `message_id`.
 
 ### Attachments and invoices
+- `spark_inspect_attachment` (alias `inspect_document`): inspect and read attachment contents (PDF text, images, text files) entirely in RAM without saving to disk.
 - `spark_get_attachment`: attachment metadata and its path in Spark's local cache.
 - `spark_search_attachments`: search attachments by file name or MIME type.
 - `spark_search_attachment_content`: full-text search inside PDFs and documents.

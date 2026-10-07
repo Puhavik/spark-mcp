@@ -14,6 +14,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 import sys
 import os
 import re
+import io
 import json
 import base64
 import sqlite3
@@ -622,6 +623,198 @@ def spark_get_attachment(attachment_id=None, message_id=None, filename=None):
             "cached_locally": found_path is not None,
             "file_path": found_path
         }
+
+
+def spark_inspect_attachment(attachment_id=None, message_id=None, filename=None, **kwargs):
+    """
+    Inspect and read the contents of an attachment (PDF, image, document, text)
+    entirely in memory (RAM, no disk footprint), like inspect_document in telegram-mcp.
+
+    Returns extracted text for PDFs and documents, or an image block for photos/scans
+    to allow instant visual verification in Claude.
+
+    Args:
+        attachment_id: ID of the attachment (pk) from messageAttachment table.
+        message_id: ID of the email message containing the attachment.
+        filename: Optional name or substring of attachment filename to match.
+    """
+    with closing(get_ro_conn(MESSAGES_DB)) as conn:
+        c = conn.cursor()
+        if attachment_id:
+            c.execute("""
+                SELECT a.pk, a.messagePk, a.attachmentName, a.attachmentSize, a.attachmentMIMEType,
+                       a.attachmentURL, m.accountPk
+                FROM messageAttachment a
+                JOIN messages m ON a.messagePk = m.pk
+                WHERE a.pk = ?
+            """, (int(attachment_id),))
+            att = c.fetchone()
+        elif message_id and filename:
+            c.execute("""
+                SELECT a.pk, a.messagePk, a.attachmentName, a.attachmentSize, a.attachmentMIMEType,
+                       a.attachmentURL, m.accountPk
+                FROM messageAttachment a
+                JOIN messages m ON a.messagePk = m.pk
+                WHERE a.messagePk = ? AND a.attachmentName LIKE ?
+                LIMIT 1
+            """, (int(message_id), f"%{filename}%"))
+            att = c.fetchone()
+        elif message_id:
+            c.execute("""
+                SELECT a.pk, a.messagePk, a.attachmentName, a.attachmentSize, a.attachmentMIMEType,
+                       a.attachmentURL, m.accountPk
+                FROM messageAttachment a
+                JOIN messages m ON a.messagePk = m.pk
+                WHERE a.messagePk = ?
+                LIMIT 1
+            """, (int(message_id),))
+            att = c.fetchone()
+        else:
+            raise ValueError("Provide either attachment_id, or message_id (+ optional filename)")
+
+        if not att:
+            if message_id:
+                return f"There is no attached document or media file in message {message_id}."
+            return "Attachment not found in database."
+
+        att_id = att["pk"]
+        att_name = att["attachmentName"] or "attachment"
+        account_pk = att["accountPk"]
+        msg_pk = att["messagePk"]
+        att_url = att["attachmentURL"]
+        mime_type = (att["attachmentMIMEType"] or "").lower()
+        ext = os.path.splitext(att_name)[1].lower()
+
+        data = None
+        found_path = find_cached_attachment_file(account_pk, msg_pk, att_name, att_url)
+        if found_path and os.path.isfile(found_path):
+            with open(found_path, "rb") as f:
+                data = f.read()
+        elif os.path.exists(SPARK_CLI):
+            try:
+                proc = subprocess.run(
+                    [SPARK_CLI, "attachment", str(att_id), "--stream"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    data = proc.stdout
+            except Exception:
+                pass
+
+        if not data:
+            if os.path.exists(SEARCH_DB):
+                try:
+                    with closing(get_ro_conn(SEARCH_DB)) as sconn:
+                        rows = sconn.execute(
+                            "SELECT text FROM attachmentsfts WHERE attachmentPk = ? ORDER BY chunkIndex ASC",
+                            (att_id,)
+                        ).fetchall()
+                        text_chunks = [r["text"] for r in rows if r["text"]]
+                        if text_chunks:
+                            return f"Contents of document '{att_name}' (extracted from Spark index):\n\n" + "\n\n".join(text_chunks)
+                except Exception:
+                    pass
+            return f"Attachment '{att_name}' (ID {att_id}) is not cached locally. Run Spark with CLI or download it first."
+
+        # 1. If this is an image or scan
+        if mime_type.startswith("image/") or ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            fmt = (
+                "png"
+                if (ext == ".png" or mime_type == "image/png")
+                else (
+                    "webp"
+                    if (ext == ".webp" or mime_type == "image/webp")
+                    else ("gif" if (ext == ".gif" or mime_type == "image/gif") else "jpeg")
+                )
+            )
+            b64_data = base64.b64encode(data).decode("ascii")
+            del data
+            return {
+                "_mcp_content": [
+                    {
+                        "type": "image",
+                        "data": b64_data,
+                        "mimeType": f"image/{fmt}"
+                    }
+                ]
+            }
+
+        # 2. If this is a PDF
+        if mime_type == "application/pdf" or ext == ".pdf":
+            text_pages = []
+            has_any_text = False
+            read_error = None
+            try:
+                try:
+                    from pypdf import PdfReader
+                except ImportError:
+                    from PyPDF2 import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                for i, page in enumerate(reader.pages):
+                    extracted = (page.extract_text() or "").strip()
+                    if extracted:
+                        has_any_text = True
+                    text_pages.append(f"--- Page {i + 1} ---\n{extracted}")
+            except Exception as e:
+                read_error = e
+
+            del data
+
+            if has_any_text:
+                full_text = "\n\n".join(text_pages).strip()
+                return f"Contents of document '{att_name}' ({len(text_pages)} pages):\n\n{full_text}"
+
+            if os.path.exists(SEARCH_DB):
+                try:
+                    with closing(get_ro_conn(SEARCH_DB)) as sconn:
+                        rows = sconn.execute(
+                            "SELECT text FROM attachmentsfts WHERE attachmentPk = ? ORDER BY chunkIndex ASC",
+                            (att_id,)
+                        ).fetchall()
+                        text_chunks = [r["text"] for r in rows if r["text"]]
+                        if text_chunks:
+                            return f"Contents of document '{att_name}' (extracted from Spark index):\n\n" + "\n\n".join(text_chunks)
+                except Exception:
+                    pass
+
+            if read_error and not text_pages:
+                return f"Error reading PDF '{att_name}': {str(read_error)}"
+
+            pages_count = len(text_pages) if text_pages else 0
+            pages_info = f" ({pages_count} pages)" if pages_count else ""
+            return (
+                f"Document '{att_name}'{pages_info} "
+                "does not contain a text layer (possibly a scanned image without OCR)."
+            )
+
+        # 3. If this is a text file (TXT, CSV, JSON, MD, LOG, XML, HTML, ICS, etc.)
+        if (
+            mime_type.startswith("text/")
+            or ext in {
+                ".txt", ".csv", ".json", ".md", ".log", ".yaml", ".yml", ".xml", ".html", ".ics", ".rtf", ".tsv"
+            }
+            or mime_type in {
+                "application/json", "application/xml", "application/javascript", "text/calendar"
+            }
+        ):
+            try:
+                text_content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text_content = data.decode("latin-1", errors="replace")
+            del data
+            return text_content
+
+        del data
+        return (
+            f"File format '{att_name}' ({mime_type}) "
+            "is not currently supported for direct text analysis."
+        )
+
+
+spark_inspect_document = spark_inspect_attachment
+inspect_document = spark_inspect_attachment
 
 
 def spark_search_attachments(query=None, mime_type=None, limit=20):
@@ -1838,6 +2031,42 @@ TOOLS_SCHEMA = [
         }
     },
     {
+        "name": "spark_inspect_attachment",
+        "description": "Inspect and read the contents of an email attachment (PDF, image, document, text) entirely in memory (RAM, no disk footprint). Returns extracted text for PDFs and documents, or an image block for photos/scans to allow visual inspection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "integer", "description": "ID of the attachment from spark_get_message or spark_search_attachments."},
+                "message_id": {"type": "integer", "description": "Message ID containing the attachment."},
+                "filename": {"type": "string", "description": "Name or part of filename of the attachment to find."}
+            }
+        }
+    },
+    {
+        "name": "spark_inspect_document",
+        "description": "Alias for spark_inspect_attachment. Inspect and read an email attachment entirely in RAM without saving to disk.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "integer", "description": "ID of the attachment."},
+                "message_id": {"type": "integer", "description": "Message ID containing the attachment."},
+                "filename": {"type": "string", "description": "Name or part of filename of the attachment."}
+            }
+        }
+    },
+    {
+        "name": "inspect_document",
+        "description": "Inspect and read the contents of an email attachment (PDF, image, or text file) entirely in memory (RAM, no disk footprint), same as in telegram-mcp.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "integer", "description": "ID of the attachment."},
+                "message_id": {"type": "integer", "description": "Message ID containing the attachment."},
+                "filename": {"type": "string", "description": "Name or part of filename of the attachment."}
+            }
+        }
+    },
+    {
         "name": "spark_search_attachments",
         "description": "Search attachments across all emails by filename, extension, or MIME type (e.g. 'invoice', 'pdf', 'png').",
         "inputSchema": {
@@ -2189,16 +2418,23 @@ def handle_request(req):
                     raise ValueError(f"Unknown tool: {tool_name} (Spark CLI tools need Spark running)")
                 res = call_cli_tool(tool_name, args)
 
+            if isinstance(res, dict) and "_mcp_content" in res:
+                content = res["_mcp_content"]
+            elif isinstance(res, str):
+                content = [{"type": "text", "text": res}]
+            else:
+                content = [
+                    {
+                        "type": "text",
+                        "text": json.dumps(res, ensure_ascii=False, separators=(",", ":"))
+                    }
+                ]
+
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(res, ensure_ascii=False, separators=(",", ":"))
-                        }
-                    ],
+                    "content": content,
                     "isError": False
                 }
             }
