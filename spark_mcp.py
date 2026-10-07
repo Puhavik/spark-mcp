@@ -28,7 +28,7 @@ import xml.etree.ElementTree as ET
 from contextlib import closing
 from datetime import datetime
 from email.message import EmailMessage
-from email.utils import formatdate, getaddresses
+from email.utils import formatdate, getaddresses, parseaddr
 from html.parser import HTMLParser
 import html
 
@@ -108,6 +108,14 @@ def sanitize_user_content(text, max_length=None):
     return result
 
 
+def split_sender(sender_str):
+    """Split 'Name <email@domain>' into clean ('Name', 'email@domain')."""
+    if not sender_str:
+        return "", ""
+    name, addr = parseaddr(sender_str)
+    return sanitize_user_content(name.strip()), addr.strip()
+
+
 # Tool Exposure Profiles
 MUTATING_TOOLS = {
     "spark_compose_email",
@@ -158,6 +166,22 @@ def is_tool_exposed(name):
     return name.lower() in allowed
 
 
+def get_tool_annotations(name):
+    """Return MCP 2024-11 tool annotations (readOnlyHint, destructiveHint, idempotentHint)."""
+    if name in MUTATING_TOOLS:
+        is_destructive = name in {"spark_cli_draft", "spark_cli_action"}
+        return {
+            "readOnlyHint": False,
+            "destructiveHint": is_destructive,
+            "idempotentHint": name.startswith("spark_export")
+        }
+    return {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True
+    }
+
+
 CATEGORY_MAP = {
     0: "other",
     1: "personal",
@@ -173,7 +197,8 @@ def get_ro_conn(db_path):
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found: {db_path}")
     uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    conn = sqlite3.connect(uri, uri=True, timeout=20.0)
+    conn.execute("PRAGMA busy_timeout = 20000")
     conn.row_factory = sqlite3.Row
     # Spark stores raw folded headers ("Name\r\n <addr>"); unfold them for every TEXT column.
     conn.text_factory = lambda b: b.decode("utf-8", errors="replace").replace("\r\n ", " ").replace("\r\n\t", " ")
@@ -545,12 +570,15 @@ def spark_list_messages(account_id=None, folder_id=None, category=None, only_inb
         messages = []
         for r in rows:
             cat_val = r["category"]
+            from_name, from_email = split_sender(r["messageFrom"])
             messages.append({
                 "message_id": r["pk"],
                 "conversation_id": r["conversationPk"],
                 "account_id": r["accountPk"],
                 "date": format_timestamp(r["receivedDate"]),
                 "from": r["messageFrom"],
+                "from_name": from_name,
+                "from_email": from_email,
                 "to": r["messageTo"],
                 "subject": sanitize_user_content(r["subject"] or ""),
                 "snippet": sanitize_user_content(r["shortBody"] or ""),
@@ -607,12 +635,15 @@ def spark_get_message(message_id, format="text", exclude_quoted_history=False):
         if not body:
             body = clean_unquoted or msg["shortBody"] or ""
 
+    from_name, from_email = split_sender(msg["messageFrom"])
     return {
         "message_id": msg["pk"],
         "conversation_id": msg["conversationPk"],
         "account_id": msg["accountPk"],
         "received_date": format_timestamp(msg["receivedDate"]),
         "from": msg["messageFrom"],
+        "from_name": from_name,
+        "from_email": from_email,
         "to": msg["messageTo"],
         "cc": msg["messageCc"],
         "bcc": msg["messageBcc"],
@@ -664,14 +695,17 @@ def spark_get_thread(conversation_id=None, message_id=None, format="text", exclu
             else:
                 body = get_message_body(m_pk, format=format) or clean_unquoted or r["shortBody"] or ""
 
+            from_name, from_email = split_sender(r["messageFrom"])
             messages.append({
                 "message_id": m_pk,
                 "account_id": r["accountPk"],
                 "date": format_timestamp(r["receivedDate"]),
                 "from": r["messageFrom"],
+                "from_name": from_name,
+                "from_email": from_email,
                 "to": r["messageTo"],
                 "cc": r["messageCc"],
-                "subject": r["subject"] or "",
+                "subject": sanitize_user_content(r["subject"] or ""),
                 "category": CATEGORY_MAP.get(r["category"], "other"),
                 "detected_language": lang,
                 "body": body,
@@ -1689,12 +1723,15 @@ def spark_search_messages(query, limit=20):
                     """, (match_expr, limit))
                     rows = fc.fetchall()
                     for r in rows:
+                        from_name, from_email = split_sender(r["messageFrom"])
                         results.append({
                             "message_id": r["messagePk"],
                             "from": r["messageFrom"],
+                            "from_name": from_name,
+                            "from_email": from_email,
                             "to": r["messageTo"],
-                            "subject": r["subject"] or "",
-                            "snippet": (r["searchBody"] or "")[:200],
+                            "subject": sanitize_user_content(r["subject"] or ""),
+                            "snippet": sanitize_user_content((r["searchBody"] or "")[:200]),
                             "date": format_timestamp(r["receivedDate"])
                         })
         except Exception as e:
@@ -1713,12 +1750,15 @@ def spark_search_messages(query, limit=20):
             """, (like_pattern, like_pattern, like_pattern, limit))
             rows = c.fetchall()
             for r in rows:
+                from_name, from_email = split_sender(r["messageFrom"])
                 results.append({
                     "message_id": r["pk"],
                     "from": r["messageFrom"],
+                    "from_name": from_name,
+                    "from_email": from_email,
                     "to": r["messageTo"],
-                    "subject": r["subject"] or "",
-                    "snippet": r["shortBody"] or "",
+                    "subject": sanitize_user_content(r["subject"] or ""),
+                    "snippet": sanitize_user_content(r["shortBody"] or ""),
                     "date": format_timestamp(r["receivedDate"])
                 })
 
@@ -2605,7 +2645,12 @@ def handle_request(req):
             sys.stderr.write(f"Spark CLI tools unavailable: {e}\n")
             cli_tools = []
         all_tools = TOOLS_SCHEMA + cli_tools
-        exposed_tools = [t for t in all_tools if is_tool_exposed(t["name"])]
+        exposed_tools = []
+        for t in all_tools:
+            if is_tool_exposed(t["name"]):
+                item = dict(t)
+                item["annotations"] = get_tool_annotations(t["name"])
+                exposed_tools.append(item)
         return {
             "jsonrpc": "2.0",
             "id": req_id,

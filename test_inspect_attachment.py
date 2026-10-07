@@ -315,6 +315,36 @@ def test_tool_exposure_filtering():
         assert spark_mcp.is_tool_exposed("spark_get_latest_otp") is False
 
 
+def test_sender_splitting():
+    name, email = spark_mcp.split_sender("John Doe <john@example.com>")
+    assert name == "John Doe"
+    assert email == "john@example.com"
+
+    name, email = spark_mcp.split_sender("support@service.io")
+    assert name == ""
+    assert email == "support@service.io"
+
+    name, email = spark_mcp.split_sender("")
+    assert name == ""
+    assert email == ""
+
+
+def test_tool_annotations():
+    ro_ann = spark_mcp.get_tool_annotations("spark_list_messages")
+    assert ro_ann["readOnlyHint"] is True
+    assert ro_ann["destructiveHint"] is False
+
+    write_ann = spark_mcp.get_tool_annotations("spark_compose_email")
+    assert write_ann["readOnlyHint"] is False
+
+    req = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    resp = spark_mcp.handle_request(req)
+    tools = resp["result"]["tools"]
+    first = next(t for t in tools if t["name"] == "spark_list_messages")
+    assert "annotations" in first
+    assert first["annotations"]["readOnlyHint"] is True
+
+
 if __name__ == "__main__":
     test_tool_registration()
     test_missing_args()
@@ -326,6 +356,8 @@ if __name__ == "__main__":
     test_prompt_injection_sanitizer()
     test_export_path_jailing()
     test_tool_exposure_filtering()
+    test_sender_splitting()
+    test_tool_annotations()
     test_handle_request_protocol()
     test_zero_disk_footprint()
     print("ALL CHECKS PASSED SUCCESSFULLY.")
