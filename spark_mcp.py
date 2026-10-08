@@ -62,7 +62,8 @@ if _env_roots:
 def validate_safe_export_path(path):
     """Ensure export destination path is jailed within allowed roots (default ~/Downloads)."""
     real = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
-    if not any(real == root or real.startswith(root + os.sep) for root in SPARK_ALLOWED_ROOTS):
+    allowed_roots = [os.path.realpath(os.path.abspath(os.path.expanduser(r))) for r in SPARK_ALLOWED_ROOTS]
+    if not any(real == root or real.startswith(root + os.sep) for root in allowed_roots):
         roots_str = ", ".join(SPARK_ALLOWED_ROOTS)
         raise PermissionError(
             f"Path '{path}' is outside allowed export directories: [{roots_str}]. Allowed default is ~/Downloads."
