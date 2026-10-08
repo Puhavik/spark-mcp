@@ -23,6 +23,7 @@ import time
 import subprocess
 import urllib.parse
 import unicodedata
+import csv
 import zipfile
 import xml.etree.ElementTree as ET
 from contextlib import closing
@@ -242,6 +243,41 @@ def format_timestamp(ts):
         return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(ts)
+
+
+def parse_date_to_timestamp(val, end_of_day=False):
+    """
+    Parse a date string or timestamp into a Unix timestamp (seconds).
+    Supports:
+      - Raw int/float or numeric string (e.g. 1728000000)
+      - ISO 8601 strings (e.g. '2026-10-01', '2026-10-01T14:30:00', '2026-10-01 14:30:00')
+      - Common date formats ('%Y-%m-%d', '%Y/%m/%d', '%d.%m.%Y')
+    If end_of_day is True and only a date is provided, sets time to 23:59:59.
+    """
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    val_str = str(val).strip()
+    try:
+        return float(val_str)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(val_str)
+        if end_of_day and len(val_str) <= 10:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.timestamp()
+    except Exception:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%d.%m.%Y"):
+            try:
+                dt = datetime.strptime(val_str, fmt)
+                if end_of_day and fmt in ("%Y/%m/%d", "%d.%m.%Y"):
+                    dt = dt.replace(hour=23, minute=59, second=59)
+                return dt.timestamp()
+            except Exception:
+                pass
+        raise ValueError(f"Unrecognized date format: '{val}'. Expected YYYY-MM-DD, ISO string, or timestamp.")
 
 
 def get_message_body(message_id, format="text"):
@@ -524,7 +560,7 @@ def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, cat
         return threads
 
 
-def spark_list_messages(account_id=None, folder_id=None, category=None, only_inbox=False, only_unseen=False, only_starred=False, limit=10, offset=0):
+def spark_list_messages(account_id=None, folder_id=None, category=None, only_inbox=False, only_unseen=False, only_starred=False, limit=10, offset=0, days=None, since_date=None, until_date=None):
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
@@ -557,6 +593,25 @@ def spark_list_messages(account_id=None, folder_id=None, category=None, only_inb
             where_clauses.append("m.unseen = 1")
         if only_starred:
             where_clauses.append("m.starred = 1")
+        if days is not None:
+            try:
+                d_val = float(days)
+            except (ValueError, TypeError):
+                raise ValueError(f"Invalid days value: {days}. Expected a number.")
+            if d_val < 0:
+                raise ValueError(f"days must be non-negative, got {days}")
+            where_clauses.append("m.receivedDate >= ?")
+            params.append(time.time() - (d_val * 86400))
+        if since_date is not None:
+            s_ts = parse_date_to_timestamp(since_date)
+            if s_ts is not None:
+                where_clauses.append("m.receivedDate >= ?")
+                params.append(s_ts)
+        if until_date is not None:
+            u_ts = parse_date_to_timestamp(until_date, end_of_day=True)
+            if u_ts is not None:
+                where_clauses.append("m.receivedDate <= ?")
+                params.append(u_ts)
 
         if where_clauses:
             query += " AND " + " AND ".join(where_clauses)
@@ -1765,20 +1820,55 @@ def spark_search_messages(query, limit=20):
     return results
 
 
+def resolve_email_recipient(to_str):
+    """
+    Resolve recipient string into comma-separated bare email addresses.
+    If a recipient is a human or contact name without '@', searches Spark contacts database.
+    """
+    if not to_str or not str(to_str).strip():
+        raise ValueError("Recipient address or name cannot be empty.")
+
+    to_str = str(to_str).strip()
+    reader = csv.reader([to_str], skipinitialspace=True)
+    items = next(reader, [])
+
+    resolved = []
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+        if "@" in item:
+            addrs = [a for _, a in getaddresses([item]) if a and "@" in a]
+            if addrs:
+                resolved.extend(addrs)
+            else:
+                resolved.append(item)
+        else:
+            contacts = spark_search_contacts(item, limit=1)
+            if contacts and contacts[0].get("email"):
+                resolved.append(contacts[0]["email"])
+            else:
+                raise ValueError(f"Could not resolve contact '{item}' to an email address.")
+
+    if not resolved:
+        raise ValueError(f"No valid email addresses found in '{to_str}'.")
+    return ",".join(resolved)
+
+
 def spark_compose_email(to, subject="", body="", cc="", bcc=""):
+    to_bare = resolve_email_recipient(to)
+
     params = {}
     if subject:
         params["subject"] = subject
     if body:
         params["body"] = body
     if cc:
-        params["cc"] = cc
+        params["cc"] = resolve_email_recipient(cc)
     if bcc:
-        params["bcc"] = bcc
+        params["bcc"] = resolve_email_recipient(bcc)
 
-    # `to` may be "Name <addr>" from a sender-controlled header: keep bare addresses only.
-    to_bare = ",".join(a for _, a in getaddresses([to]) if a)
-    query_str = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    query_str = urllib.parse.urlencode(params, safe="@,", quote_via=urllib.parse.quote)
     to_q = urllib.parse.quote(to_bare, safe=",@")
     mailto_url = f"mailto:{to_q}?{query_str}" if query_str else f"mailto:{to_q}"
 
@@ -1786,12 +1876,15 @@ def spark_compose_email(to, subject="", body="", cc="", bcc=""):
     if res.returncode != 0:
         raise RuntimeError(f"Failed to open Spark Desktop composer: {res.stderr}")
 
-    return {
+    out = {
         "status": "opened",
-        "to": to,
+        "to": to_bare,
         "subject": subject,
         "message": "Composer opened in Spark Desktop with prefilled content"
     }
+    if to != to_bare:
+        out["original_to"] = to
+    return out
 
 
 def spark_search_attachment_content(query, limit=20):
@@ -2204,7 +2297,7 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_list_messages",
-        "description": "List emails from Spark Desktop with filters (account, folder, category, inbox, unseen, starred).",
+        "description": "List emails from Spark Desktop with filters (account, folder, category, date range, inbox, unseen, starred).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2218,6 +2311,18 @@ TOOLS_SCHEMA = [
                 "only_inbox": {"type": "boolean", "description": "Only return messages currently in Inbox."},
                 "only_unseen": {"type": "boolean", "description": "Only return unread emails."},
                 "only_starred": {"type": "boolean", "description": "Only return starred/flagged emails."},
+                "days": {
+                    "type": "number",
+                    "description": "Filter emails received within the last N days (e.g. 7 for past week, 1 for past 24 hours)."
+                },
+                "since_date": {
+                    "type": "string",
+                    "description": "Filter emails received on or after this date/time (ISO 8601 string 'YYYY-MM-DD' or timestamp)."
+                },
+                "until_date": {
+                    "type": "string",
+                    "description": "Filter emails received on or before this date/time (ISO 8601 string 'YYYY-MM-DD' or timestamp)."
+                },
                 "limit": {"type": "integer", "description": "Max messages to return (default 10, max 100).", "default": 10},
                 "offset": {"type": "integer", "description": "Offset for pagination.", "default": 0}
             }
@@ -2441,11 +2546,11 @@ TOOLS_SCHEMA = [
             "type": "object",
             "required": ["to"],
             "properties": {
-                "to": {"type": "string", "description": "Recipient email address."},
+                "to": {"type": "string", "description": "Recipient email address or contact name (auto-resolved from contacts)."},
                 "subject": {"type": "string", "description": "Subject of the email."},
                 "body": {"type": "string", "description": "Email body content."},
-                "cc": {"type": "string", "description": "CC recipients."},
-                "bcc": {"type": "string", "description": "BCC recipients."}
+                "cc": {"type": "string", "description": "CC recipients (email addresses or contact names)."},
+                "bcc": {"type": "string", "description": "BCC recipients (email addresses or contact names)."}
             }
         }
     },

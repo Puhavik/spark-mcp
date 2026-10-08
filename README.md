@@ -25,6 +25,8 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 - **Prompt injection defense.** Automatically strips zero-width invisible Unicode characters, bidi overrides, and malicious formatting from untrusted incoming emails.
 - **Tool surface restriction (`SPARK_EXPOSED_TOOLS`).** Configurable tool exposure (`all`, `read-only`, `read-only+spark_compose_email`, or `core`) to protect against unauthorized writes and save thousands of tokens in Claude's context window.
 - **Safe export directory jailing.** Exports default to and are strictly jailed inside `~/Downloads` (customizable via `SPARK_ALLOWED_ROOTS`), preventing directory traversal.
+- **Date range filtering.** Filter messages by relative days (`days=7`) or specific date bounds (`since_date`, `until_date` in ISO format or timestamps).
+- **Smart contact resolution.** Compose emails using human names or nicknames; recipient names without `@` are automatically resolved against Spark's contact book.
 - **Export.** Messages to HTML, TXT or EML; threads to Markdown (jailed to `~/Downloads`).
 
 ## Requirements
@@ -150,7 +152,7 @@ Ask your assistant, for example:
 - `spark_list_folders`: folders with message counts.
 
 ### Reading and threads
-- `spark_list_messages`: messages with filters (`account_id`, `folder_id`, `category`, `only_inbox`, `only_unseen`, `only_starred`, `limit`, `offset`).
+- `spark_list_messages`: messages with filters (`account_id`, `folder_id`, `category`, `days`, `since_date`, `until_date`, `only_inbox`, `only_unseen`, `only_starred`, `limit`, `offset`).
 - `spark_list_threads`: threads with participants, total and unread counts, inbox status.
 - `spark_get_message`: full message (subject, body, recipients, language, category, attachments; optional `exclude_quoted_history`).
 - `spark_get_thread`: all messages of a thread by `conversation_id` or `message_id`.
@@ -185,7 +187,7 @@ Ask your assistant, for example:
 - `spark_export_thread`: export a thread to Markdown (default path `~/Downloads/Thread_<id>_<subject>.md`).
 
 ### Composing and replying
-- `spark_compose_email`: open a new pre-filled message in Spark.
+- `spark_compose_email`: open a new pre-filled message in Spark (supports emails or contact names with automatic address resolution).
 - `spark_reply_to_email`: open a pre-filled reply (respects `Reply-To`, `Re:` subject, signature in the message language).
 
 ## Limitations

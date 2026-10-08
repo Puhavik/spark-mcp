@@ -345,6 +345,91 @@ def test_tool_annotations():
     assert first["annotations"]["readOnlyHint"] is True
 
 
+def test_date_filtering():
+    # Helper parse_date_to_timestamp checks
+    assert spark_mcp.parse_date_to_timestamp(1728000000) == 1728000000.0
+    assert spark_mcp.parse_date_to_timestamp("1728000000") == 1728000000.0
+    ts_start = spark_mcp.parse_date_to_timestamp("2026-10-01")
+    ts_end = spark_mcp.parse_date_to_timestamp("2026-10-01", end_of_day=True)
+    assert ts_end - ts_start == 86399.0
+    assert spark_mcp.parse_date_to_timestamp("2026-10-01T12:00:00") is not None
+
+    try:
+        spark_mcp.parse_date_to_timestamp("not-a-valid-date")
+        assert False, "Should raise ValueError for invalid date"
+    except ValueError:
+        pass
+
+    # spark_list_messages parameter validation & SQL query assembly
+    try:
+        spark_mcp.spark_list_messages(days=-1)
+        assert False, "Should raise ValueError for negative days"
+    except ValueError:
+        pass
+
+    with patch("spark_mcp.get_ro_conn") as mock_conn:
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        mock_conn.return_value.cursor.return_value = mock_cursor
+
+        spark_mcp.spark_list_messages(days=7, until_date="2026-10-08")
+        query, params = mock_cursor.execute.call_args[0]
+        assert "m.receivedDate >= ?" in query
+        assert "m.receivedDate <= ?" in query
+        assert len(params) == 4  # days_ts, until_ts, limit, offset
+
+
+def test_contact_resolution():
+    # Standard email formatting
+    assert spark_mcp.resolve_email_recipient("dev@example.com") == "dev@example.com"
+    assert spark_mcp.resolve_email_recipient("John Doe <john@example.com>") == "john@example.com"
+    assert spark_mcp.resolve_email_recipient("a@b.com, c@d.com") == "a@b.com,c@d.com"
+
+    # Auto-resolution from contacts
+    with patch("spark_mcp.spark_search_contacts") as mock_search:
+        mock_search.return_value = [{"email": "boss@company.com", "name": "Boss", "quality": 3}]
+
+        res_email = spark_mcp.resolve_email_recipient("Boss")
+        assert res_email == "boss@company.com"
+        mock_search.assert_called_with("Boss", limit=1)
+
+    # Resolution error when contact not found
+    with patch("spark_mcp.spark_search_contacts", return_value=[]):
+        try:
+            spark_mcp.resolve_email_recipient("Unknown Contact")
+            assert False, "Should raise ValueError when contact is not found"
+        except ValueError as e:
+            assert "Could not resolve contact 'Unknown Contact'" in str(e)
+
+    # Empty recipient check
+    try:
+        spark_mcp.resolve_email_recipient("   ")
+        assert False, "Should raise ValueError on empty recipient"
+    except ValueError:
+        pass
+
+    # spark_compose_email integration with auto-resolution
+    with patch("spark_mcp.spark_search_contacts", return_value=[{"email": "alex@corp.com", "name": "Alex", "quality": 3}]), \
+         patch("subprocess.run") as mock_subproc:
+        mock_subproc.return_value = MagicMock(returncode=0)
+
+        out = spark_mcp.spark_compose_email(to="Alex", subject="Meeting", body="Let's talk", cc="chief@corp.com")
+        assert out["status"] == "opened"
+        assert out["to"] == "alex@corp.com"
+        assert out["original_to"] == "Alex"
+        assert out["subject"] == "Meeting"
+
+        cmd = mock_subproc.call_args[0][0]
+        assert cmd[0] == "open"
+        assert cmd[1] == "-a"
+        assert cmd[2] == "Spark Desktop"
+        mailto_url = cmd[3]
+        assert "mailto:alex@corp.com?" in mailto_url
+        assert "subject=Meeting" in mailto_url
+        assert "body=Let%27s%20talk" in mailto_url
+        assert "cc=chief@corp.com" in mailto_url
+
+
 if __name__ == "__main__":
     test_tool_registration()
     test_missing_args()
@@ -360,4 +445,6 @@ if __name__ == "__main__":
     test_tool_annotations()
     test_handle_request_protocol()
     test_zero_disk_footprint()
+    test_date_filtering()
+    test_contact_resolution()
     print("ALL CHECKS PASSED SUCCESSFULLY.")
