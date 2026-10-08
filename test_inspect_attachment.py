@@ -430,6 +430,193 @@ def test_contact_resolution():
         assert "cc=chief@corp.com" in mailto_url
 
 
+def test_persistent_conn_proxy():
+    # Test connection caching and duplicate ATTACH handling
+    with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp_db:
+        conn1 = spark_mcp.get_ro_conn(tmp_db.name)
+        conn2 = spark_mcp.get_ro_conn(tmp_db.name)
+        assert conn1 is conn2
+
+        # Test proxy close() is no-op
+        conn1.close()
+        c = conn1.cursor()
+        c.execute("SELECT 1")
+        assert c.fetchone()[0] == 1
+
+        # Test duplicate ATTACH is handled gracefully
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp_db2:
+            c.execute(f"ATTACH DATABASE '{tmp_db2.name}' AS attached_test")
+            # Running attach again with same alias
+            c.execute(f"ATTACH DATABASE '{tmp_db2.name}' AS attached_test")
+
+
+def test_resources_protocol():
+    # 1. resources/list
+    res_list = spark_mcp.handle_request({"jsonrpc": "2.0", "id": 1, "method": "resources/list"})
+    assert "resources" in res_list["result"]
+    assert len(res_list["result"]["resources"]) == 3
+    uris = [r["uri"] for r in res_list["result"]["resources"]]
+    assert "email://accounts" in uris
+    assert "email://folders" in uris
+    assert "email://signatures" in uris
+
+    # 2. resources/templates/list
+    res_templates = spark_mcp.handle_request({"jsonrpc": "2.0", "id": 2, "method": "resources/templates/list"})
+    assert "resourceTemplates" in res_templates["result"]
+    assert len(res_templates["result"]["resourceTemplates"]) == 2
+
+    # 3. resources/read email://accounts
+    with patch("spark_mcp.spark_list_accounts", return_value=[{"account_id": 1, "email": "test@example.com"}]):
+        res_read = spark_mcp.handle_request({
+            "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+            "params": {"uri": "email://accounts"}
+        })
+        assert "contents" in res_read["result"]
+        content = res_read["result"]["contents"][0]
+        assert content["uri"] == "email://accounts"
+        assert content["mimeType"] == "application/json"
+        data = json.loads(content["text"])
+        assert data[0]["email"] == "test@example.com"
+
+    # 4. resources/read email://messages/42
+    with patch("spark_mcp.spark_get_message", return_value={"message_id": 42, "subject": "Hello"}):
+        res_msg = spark_mcp.handle_request({
+            "jsonrpc": "2.0", "id": 4, "method": "resources/read",
+            "params": {"uri": "email://messages/42"}
+        })
+        content = res_msg["result"]["contents"][0]
+        assert content["uri"] == "email://messages/42"
+        data = json.loads(content["text"])
+        assert data["message_id"] == 42
+
+
+def test_prompts_protocol():
+    # 1. prompts/list
+    prompts_list = spark_mcp.handle_request({"jsonrpc": "2.0", "id": 10, "method": "prompts/list"})
+    assert "prompts" in prompts_list["result"]
+    p_names = [p["name"] for p in prompts_list["result"]["prompts"]]
+    assert "inbox_triage" in p_names
+    assert "daily_briefing" in p_names
+    assert "draft_reply" in p_names
+
+    # 2. prompts/get inbox_triage
+    with patch("spark_mcp.spark_get_unread_summary", return_value={"total_unread": 5}), \
+         patch("spark_mcp.spark_find_unreplied_emails", return_value=[]):
+        p_triage = spark_mcp.handle_request({
+            "jsonrpc": "2.0", "id": 11, "method": "prompts/get",
+            "params": {"name": "inbox_triage", "arguments": {"limit": 5}}
+        })
+        assert "messages" in p_triage["result"]
+        msg_text = p_triage["result"]["messages"][0]["content"]["text"]
+        assert "inbox triage" in msg_text.lower()
+
+    # 3. prompts/get draft_reply
+    with patch("spark_mcp.spark_get_message", return_value={"message_id": 99, "from": "boss@co.com", "subject": "Urgent", "body": "Please update.", "conversation_id": None}):
+        p_reply = spark_mcp.handle_request({
+            "jsonrpc": "2.0", "id": 12, "method": "prompts/get",
+            "params": {"name": "draft_reply", "arguments": {"message_id": 99, "intent": "Will do by 5pm"}}
+        })
+        msg_text = p_reply["result"]["messages"][0]["content"]["text"]
+        assert "boss@co.com" in msg_text
+        assert "Will do by 5pm" in msg_text
+
+
+def test_compat_tools_fallback():
+    # Old clients calling spark_list_accounts or spark_list_folders via tools/call still work
+    with patch("spark_mcp.spark_list_accounts", return_value=[{"account_id": 1, "email": "a@b.com"}]):
+        res = spark_mcp.handle_request({
+            "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+            "params": {"name": "spark_list_accounts", "arguments": {}}
+        })
+        assert res["result"]["isError"] is False
+        assert "a@b.com" in res["result"]["content"][0]["text"]
+
+
+def test_structured_pagination():
+    mock_msg_row = {
+        "pk": 1, "accountPk": 1, "receivedDate": 1700000000, "messageFrom": "user@test.com",
+        "messageTo": "me@test.com", "subject": "Hi", "shortBody": "Preview", "unseen": 1,
+        "starred": 0, "inInbox": 1, "numberOfFileAttachments": 0, "conversationPk": 10, "category": 1
+    }
+    with patch("spark_mcp.get_ro_conn") as mock_conn:
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = [mock_msg_row] * 3  # limit was 2, returned 3 -> has_more=True
+        mock_conn.return_value.cursor.return_value = mock_cur
+
+        res = spark_mcp.spark_list_messages(limit=2, cursor=10)
+        assert res["has_more"] is True
+        assert res["next_cursor"] == 12
+        assert len(res["items"]) == 2
+
+        # Verify SQL passed OFFSET 10
+        sql, params = mock_cur.execute.call_args[0]
+        assert "LIMIT ? OFFSET ?" in sql
+        assert params[-1] == 10  # offset 10 from cursor
+
+
+def test_progress_reporting():
+    calls = []
+    def fake_safe_stdout(text):
+        calls.append(json.loads(text))
+
+    with patch("spark_mcp.safe_stdout_write", side_effect=fake_safe_stdout), \
+         patch("spark_mcp.get_ro_conn") as mock_conn, \
+         patch("spark_mcp.find_cached_attachment_file", return_value=None):
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = [
+            {"accountPk": 1, "messagePk": 1, "attachmentName": "a.pdf", "attachmentURL": "", "attachmentSize": 10, "attachmentPk": 1, "subject": "test", "messageFrom": "x", "receivedDate": 100}
+        ]
+        mock_conn.return_value.cursor.return_value = mock_cur
+
+        req = {
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {
+                "name": "spark_batch_export_attachments",
+                "arguments": {"target_dir": "~/Downloads"},
+                "_meta": {"progressToken": "token-xyz"}
+            }
+        }
+        res = spark_mcp.handle_request(req)
+        assert res["result"]["isError"] is False
+        assert len(calls) == 1
+        notif = calls[0]
+        assert notif["method"] == "notifications/progress"
+        assert notif["params"]["progressToken"] == "token-xyz"
+        assert notif["params"]["progress"] == 1
+        assert notif["params"]["total"] == 1
+
+
+def test_search_messages_sort_by():
+    with patch("spark_mcp.get_ro_conn") as mock_conn, \
+         patch("os.path.exists", return_value=True):
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = [
+            {"messagePk": 10, "messageFrom": "a@b.com", "messageTo": "c@d.com",
+             "subject": "Test", "searchBody": "Test body", "match_snippet": "<mark>Test</mark>",
+             "relevance": -5.0, "receivedDate": 1700000000}
+        ]
+        mock_conn.return_value.cursor.return_value = mock_cur
+
+        res_rel = spark_mcp.spark_search_messages("test", limit=5, sort_by="relevance")
+        assert len(res_rel) == 1
+        assert res_rel[0]["snippet"] == "<mark>Test</mark>"
+        sql_rel = mock_cur.execute.call_args_list[0][0][0]
+        assert "ORDER BY relevance ASC, m.receivedDate DESC" in sql_rel
+
+        mock_cur.reset_mock()
+        mock_cur.fetchall.return_value = [
+            {"messagePk": 10, "messageFrom": "a@b.com", "messageTo": "c@d.com",
+             "subject": "Test", "searchBody": "Test body", "match_snippet": "<mark>Test</mark>",
+             "relevance": -5.0, "receivedDate": 1700000000}
+        ]
+        res_date = spark_mcp.spark_search_messages("test", limit=5, sort_by="date")
+        assert len(res_date) == 1
+        sql_date = mock_cur.execute.call_args_list[0][0][0]
+        assert "ORDER BY m.receivedDate DESC" in sql_date
+
+
 if __name__ == "__main__":
     test_tool_registration()
     test_missing_args()
@@ -447,4 +634,11 @@ if __name__ == "__main__":
     test_zero_disk_footprint()
     test_date_filtering()
     test_contact_resolution()
+    test_persistent_conn_proxy()
+    test_resources_protocol()
+    test_prompts_protocol()
+    test_compat_tools_fallback()
+    test_structured_pagination()
+    test_progress_reporting()
+    test_search_messages_sort_by()
     print("ALL CHECKS PASSED SUCCESSFULLY.")

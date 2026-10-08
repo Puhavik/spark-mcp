@@ -9,7 +9,13 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 ## Highlights
 
 - **Single file, zero dependencies.** One script, `spark_mcp.py`, using only the Python 3 standard library. Speaks JSON-RPC over stdio.
-- **Local reads are read-only.** Spark databases are opened with `?mode=ro`. Spark uses WAL mode, so reading never blocks Spark itself.
+- **MCP Resources (`email://...`).** Serves static account metadata, folder structures, signatures, messages, and threads via standard MCP resources (`email://accounts`, `email://folders`, `email://signatures`, `email://messages/{id}`, `email://threads/{id}`), saving ~2,000 prompt tokens from tool declarations.
+- **MCP Prompts.** Built-in workflow templates: `inbox_triage` (prioritize urgent vs archive), `daily_briefing` (morning overview with shipments, invoices, calendar), and `draft_reply` (contextual reply matching tone and language).
+- **High-performance SQLite & WAL tuning.** Persistent connection proxying with `cached_statements=256`, 256MB memory-mapped I/O (`mmap_size`), in-memory temporary storage (`temp_store=MEMORY`), 64MB cache, and immediate WAL release (`isolation_level=None`).
+- **FTS5 Search with Native BM25 & Snippets.** `spark_search_messages` uses SQLite FTS5 C-level BM25 relevance weighting (subject + sender priority) and native `<mark>` snippet keyword extraction. Supports `sort_by="relevance"` (default) or `sort_by="date"`.
+- **Structured Cursor Pagination.** `spark_list_messages` and `spark_list_threads` return structured `{items, has_more, next_cursor}` for memory-efficient multi-page browsing.
+- **Progress Reporting & Resilient I/O.** Emits standard `notifications/progress` for batch operations (e.g. `spark_batch_export_attachments`), cleanly shuts down on `SIGINT`/`SIGTERM`/`BrokenPipeError`, and auto-closes connections via `atexit`.
+- **Local reads are read-only.** Spark databases are opened with `?mode=ro` and `PRAGMA query_only = 1`. Spark uses WAL mode, so reading never blocks Spark itself.
 - **Local tools never send mail.** `spark_compose_email` and `spark_reply_to_email` only open drafts in the Spark composer. The delegated `spark_cli_*` tools can act up to the access level you grant in Spark: `spark_cli_action` can send and archive, `spark_cli_draft` can delete drafts permanently, and `spark_cli_event` can send invitations. Grant only the access you want an agent to have.
 - **No network requests.** The server itself talks only to local files and the local Spark app.
 - **HTML to text.** Strips styles and scripts and returns readable message text.
@@ -20,7 +26,6 @@ It lets AI assistants such as Claude Desktop or Claude Code read, search and sum
 - **Full Spark CLI coverage (`spark_cli_*` tools).** Calendar events and RSVP, availability, drafts, comments, email and contact actions, templates, teams, meetings and Spark's own semantic search are delegated to Spark's CLI, the same backend as the official Spark MCP. The tool list is read from `spark tools`, so it always matches your Spark version and access level. Setup: in Spark **Settings > AI Agents** click **Setup CLI** (this creates `/usr/local/bin/spark`) and set an access level per account. Spark must be running. These tools can write (archive, snooze, create events) up to the level you grant; local SQLite tools work without Spark running.
 - **Calendar invites.** Parses `VEVENT` blocks from `.ics` attachments (respects `TZID`, decodes RFC 5545 escapes).
 - **Link extraction.** Splits message links into action/tracking, unsubscribe and other links.
-- **Full-text search.** Uses Spark's own FTS5 indexes for messages (prefix search) and attachment contents.
 - **Document inspection (PDF, DOCX, XLSX, Images).** Reads PDF, Word (.docx), Excel (.xlsx), images and text attachments entirely in RAM with zero external dependencies (pure Python standard library).
 - **Prompt injection defense.** Automatically strips zero-width invisible Unicode characters, bidi overrides, and malicious formatting from untrusted incoming emails.
 - **Tool surface restriction (`SPARK_EXPOSED_TOOLS`).** Configurable tool exposure (`all`, `read-only`, `read-only+spark_compose_email`, or `core`) to protect against unauthorized writes and save thousands of tokens in Claude's context window.
@@ -141,19 +146,32 @@ Ask your assistant, for example:
 - "Find all invoices from last month and copy the PDFs to ~/Downloads/invoices."
 - "Draft a reply to the last email from Anna saying I agree."
 
-## Tools (28)
+## MCP Resources & Prompts
+
+### Resources (`resources/read`)
+- `email://accounts`: All configured email accounts.
+- `email://folders`: Folder hierarchy with total and unread message counts.
+- `email://signatures`: Saved email signatures configured in Spark.
+- `email://messages/{message_id}`: Full email message content and metadata.
+- `email://threads/{conversation_id}`: Entire conversation thread history.
+
+### Prompts (`prompts/get`)
+- `inbox_triage` (`limit`): Triage unread/unreplied inbox into Urgent, Action Required, and Archive.
+- `daily_briefing` (`hours`): Comprehensive morning briefing with deliveries, invoices, calendar, and unread mail.
+- `draft_reply` (`message_id`, `intent`): Context-aware reply drafted from thread history and user guidance.
+
+## Tools (25 native + Spark CLI catalog)
 
 ### Mail and inbox triage
-- `spark_list_accounts`: all mail accounts configured in Spark.
 - `spark_get_unread_summary`: unread counts across all accounts and inboxes.
 - `spark_find_unreplied_emails`: personal inbox emails waiting for a reply, with waiting time.
 - `spark_get_latest_otp`: recent 2FA / OTP codes and verification links.
 - `spark_get_digest`: digest for the last N days, grouped by category.
-- `spark_list_folders`: folders with message counts.
+- *(Note: `spark_list_accounts`, `spark_list_folders`, and `spark_list_signatures` are available as lightweight Resources above, with automatic fallback support in `tools/call`).*
 
 ### Reading and threads
-- `spark_list_messages`: messages with filters (`account_id`, `folder_id`, `category`, `days`, `since_date`, `until_date`, `only_inbox`, `only_unseen`, `only_starred`, `limit`, `offset`).
-- `spark_list_threads`: threads with participants, total and unread counts, inbox status.
+- `spark_list_messages`: messages with filters (`account_id`, `folder_id`, `category`, `days`, `since_date`, `until_date`, `only_inbox`, `only_unseen`, `only_starred`, `limit`, `cursor`). Returns `{items, has_more, next_cursor}`.
+- `spark_list_threads`: threads with participants, total and unread counts, inbox status, and cursor pagination.
 - `spark_get_message`: full message (subject, body, recipients, language, category, attachments; optional `exclude_quoted_history`).
 - `spark_get_thread`: all messages of a thread by `conversation_id` or `message_id`.
 

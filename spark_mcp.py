@@ -18,6 +18,9 @@ import io
 import json
 import base64
 import sqlite3
+import atexit
+import signal
+import inspect
 import shutil
 import time
 import subprocess
@@ -132,7 +135,6 @@ MUTATING_TOOLS = {
 }
 
 CORE_TOOLS = {
-    "spark_list_accounts",
     "spark_get_unread_summary",
     "spark_list_threads",
     "spark_list_messages",
@@ -194,16 +196,104 @@ CATEGORY_MAP = {
 REVERSE_CATEGORY_MAP = {v: k for k, v in CATEGORY_MAP.items()}
 
 
+_CONN_CACHE = {}
+
+
+class CursorProxy:
+    """Wrapper around sqlite3.Cursor that ignores duplicate ATTACH errors."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, *args):
+        if isinstance(sql, str) and sql.strip().upper().startswith("ATTACH DATABASE"):
+            try:
+                return self._cur.execute(sql, *args)
+            except sqlite3.OperationalError as e:
+                if "already in use" in str(e):
+                    return self
+                raise
+        res = self._cur.execute(sql, *args)
+        return self if res is self._cur else res
+
+    def executemany(self, sql, *args):
+        return self._cur.executemany(sql, *args)
+
+    def __iter__(self):
+        return iter(self._cur)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class PersistentConnProxy:
+    """Wrapper that prevents closing() from destroying long-lived cached SQLite connections."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def close(self):
+        # Keep underlying SQLite connection open across requests
+        pass
+
+    def cursor(self):
+        return CursorProxy(self._conn.cursor())
+
+    def execute(self, sql, *args):
+        if isinstance(sql, str) and sql.strip().upper().startswith("ATTACH DATABASE"):
+            try:
+                return self._conn.execute(sql, *args)
+            except sqlite3.OperationalError as e:
+                if "already in use" in str(e):
+                    return None
+                raise
+        return self._conn.execute(sql, *args)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def get_ro_conn(db_path):
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found: {db_path}")
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=20.0)
-    conn.execute("PRAGMA busy_timeout = 20000")
+    real_path = os.path.realpath(db_path)
+    if real_path in _CONN_CACHE:
+        return _CONN_CACHE[real_path]
+
+    uri = f"file:{real_path}?mode=ro"
+    # isolation_level=None enables autocommit mode to release WAL read locks immediately after SELECT
+    conn = sqlite3.connect(uri, uri=True, timeout=20.0, cached_statements=256, isolation_level=None)
+    conn.execute("PRAGMA query_only = 1;")
+    conn.execute("PRAGMA busy_timeout = 20000;")
+    conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("PRAGMA cache_size = -64000;")
+    try:
+        conn.execute("PRAGMA mmap_size = 268435456;")
+    except Exception:
+        pass
     conn.row_factory = sqlite3.Row
     # Spark stores raw folded headers ("Name\r\n <addr>"); unfold them for every TEXT column.
     conn.text_factory = lambda b: b.decode("utf-8", errors="replace").replace("\r\n ", " ").replace("\r\n\t", " ")
-    return conn
+
+    proxy = PersistentConnProxy(conn)
+    _CONN_CACHE[real_path] = proxy
+    return proxy
+
+
+def close_all_connections():
+    for p, proxy in list(_CONN_CACHE.items()):
+        try:
+            proxy._conn.close()
+        except Exception:
+            pass
+    _CONN_CACHE.clear()
+
+
+atexit.register(close_all_connections)
 
 
 class HTMLToTextParser(HTMLParser):
@@ -506,7 +596,12 @@ def spark_list_folders(account_id=None):
         return folders
 
 
-def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, category=None, limit=20, offset=0):
+def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, category=None, limit=20, offset=0, cursor=None):
+    if cursor is not None:
+        try:
+            offset = int(cursor)
+        except (ValueError, TypeError):
+            pass
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
@@ -536,10 +631,14 @@ def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, cat
             sql += " WHERE " + " AND ".join(where_clauses)
 
         sql += " ORDER BY c.inboxOrSnoozeDate DESC, c.updateDate DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+        params.extend([limit + 1, offset])
 
         c.execute(sql, params)
         rows = c.fetchall()
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        next_cursor = offset + limit if has_more else None
 
         threads = []
         for r in rows:
@@ -557,10 +656,19 @@ def spark_list_threads(account_id=None, only_inbox=False, only_unseen=False, cat
                 "category": CATEGORY_MAP.get(cat_id, "other"),
                 "date": format_timestamp(r["inboxOrSnoozeDate"] or r["updateDate"])
             })
-        return threads
+        return {
+            "items": threads,
+            "has_more": has_more,
+            "next_cursor": next_cursor
+        }
 
 
-def spark_list_messages(account_id=None, folder_id=None, category=None, only_inbox=False, only_unseen=False, only_starred=False, limit=10, offset=0, days=None, since_date=None, until_date=None):
+def spark_list_messages(account_id=None, folder_id=None, category=None, only_inbox=False, only_unseen=False, only_starred=False, limit=10, offset=0, days=None, since_date=None, until_date=None, cursor=None):
+    if cursor is not None:
+        try:
+            offset = int(cursor)
+        except (ValueError, TypeError):
+            pass
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
@@ -617,10 +725,14 @@ def spark_list_messages(account_id=None, folder_id=None, category=None, only_inb
             query += " AND " + " AND ".join(where_clauses)
 
         query += " ORDER BY m.receivedDate DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+        params.extend([limit + 1, offset])
 
         c.execute(query, params)
         rows = c.fetchall()
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        next_cursor = offset + limit if has_more else None
 
         messages = []
         for r in rows:
@@ -643,7 +755,11 @@ def spark_list_messages(account_id=None, folder_id=None, category=None, only_inb
                 "in_inbox": bool(r["inInbox"]),
                 "attachments_count": r["numberOfFileAttachments"] or 0
             })
-        return messages
+        return {
+            "items": messages,
+            "has_more": has_more,
+            "next_cursor": next_cursor
+        }
 
 
 def spark_get_message(message_id, format="text", exclude_quoted_history=False):
@@ -1754,31 +1870,38 @@ def spark_list_calendar_events(start_timestamp=None, end_timestamp=None, query=N
         return events
 
 
-def spark_search_messages(query, limit=20):
+def spark_search_messages(query, limit=20, sort_by="relevance"):
     if not (query or "").strip():
         raise ValueError("query argument is required")
     limit = max(1, min(int(limit), 50))
+    sort_by_norm = "date" if str(sort_by).lower() == "date" else "relevance"
     results = []
 
     if os.path.exists(SEARCH_DB):
         try:
             with closing(get_ro_conn(SEARCH_DB)) as fts_conn:
+                fts_conn.execute(f'ATTACH DATABASE "file:{MESSAGES_DB}?mode=ro" AS msg_db')
                 fc = fts_conn.cursor()
                 clean_query = "".join(c if c.isalnum() or c.isspace() else " " for c in query).strip()
                 if clean_query:
                     match_expr = " ".join(f'"{word}"*' for word in clean_query.split())
-                    fts_conn.execute(f'ATTACH DATABASE "file:{MESSAGES_DB}?mode=ro" AS msg_db')
-                    fc.execute("""
-                        SELECT f.messagePk, f.messageFrom, f.messageTo, f.subject, f.searchBody, m.receivedDate
+                    order_clause = "relevance ASC, m.receivedDate DESC" if sort_by_norm == "relevance" else "m.receivedDate DESC"
+                    sql = f"""
+                        SELECT f.messagePk, f.messageFrom, f.messageTo, f.subject, f.searchBody,
+                               snippet(messagesfts, 4, '<mark>', '</mark>', '...', 25) AS match_snippet,
+                               bm25(messagesfts, 0.0, 5.0, 2.0, 10.0, 1.0, 0.0) AS relevance,
+                               m.receivedDate
                         FROM messagesfts f
                         LEFT JOIN msg_db.messages m ON m.pk = f.messagePk
                         WHERE messagesfts MATCH ?
-                        ORDER BY m.receivedDate DESC
+                        ORDER BY {order_clause}
                         LIMIT ?
-                    """, (match_expr, limit))
+                    """
+                    fc.execute(sql, (match_expr, limit))
                     rows = fc.fetchall()
                     for r in rows:
                         from_name, from_email = split_sender(r["messageFrom"])
+                        snippet_text = r["match_snippet"] if "match_snippet" in r.keys() and r["match_snippet"] else (r["searchBody"] or "")[:200]
                         results.append({
                             "message_id": r["messagePk"],
                             "from": r["messageFrom"],
@@ -1786,7 +1909,7 @@ def spark_search_messages(query, limit=20):
                             "from_email": from_email,
                             "to": r["messageTo"],
                             "subject": sanitize_user_content(r["subject"] or ""),
-                            "snippet": sanitize_user_content((r["searchBody"] or "")[:200]),
+                            "snippet": sanitize_user_content(snippet_text),
                             "date": format_timestamp(r["receivedDate"])
                         })
         except Exception as e:
@@ -2043,7 +2166,7 @@ def spark_get_latest_otp(service=None, max_age_hours=24):
     }
 
 
-def spark_batch_export_attachments(target_dir=None, file_extension=None, query=None, sender=None, limit=50):
+def spark_batch_export_attachments(target_dir=None, file_extension=None, query=None, sender=None, limit=50, progress_callback=None):
     """
     Batch export cached attachments matching filters to a local directory (jailed to allowed roots).
     """
@@ -2087,9 +2210,12 @@ def spark_batch_export_attachments(target_dir=None, file_extension=None, query=N
         c.execute(sql, params)
         rows = c.fetchall()
 
+        total_rows = len(rows)
         exported = []
         skipped = 0
-        for r in rows:
+        for i, r in enumerate(rows):
+            if progress_callback:
+                progress_callback(i + 1, total_rows, f"Exporting {r['attachmentName']}")
             cached_path = find_cached_attachment_file(r["accountPk"], r["messagePk"], r["attachmentName"], r["attachmentURL"])
             if not cached_path or not os.path.exists(cached_path):
                 skipped += 1
@@ -2200,15 +2326,84 @@ def spark_export_thread(conversation_id=None, message_id=None, output_path=None,
 
 
 # MCP Server Definitions
-TOOLS_SCHEMA = [
+RESOURCES_SCHEMA = [
     {
-        "name": "spark_list_accounts",
-        "description": "Get all email accounts configured in Spark Desktop.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {}
-        }
+        "uri": "email://accounts",
+        "name": "Accounts",
+        "description": "All mail accounts configured in Spark Desktop",
+        "mimeType": "application/json"
     },
+    {
+        "uri": "email://folders",
+        "name": "Folders",
+        "description": "Folder hierarchy and unread message counts across accounts",
+        "mimeType": "application/json"
+    },
+    {
+        "uri": "email://signatures",
+        "name": "Signatures",
+        "description": "Active email signatures configured in Spark Desktop",
+        "mimeType": "application/json"
+    }
+]
+
+RESOURCE_TEMPLATES_SCHEMA = [
+    {
+        "uriTemplate": "email://messages/{message_id}",
+        "name": "Email Message",
+        "description": "Read full content of an email by its message ID",
+        "mimeType": "application/json"
+    },
+    {
+        "uriTemplate": "email://threads/{conversation_id}",
+        "name": "Conversation Thread",
+        "description": "Read full conversation history by conversation ID",
+        "mimeType": "application/json"
+    }
+]
+
+PROMPTS_SCHEMA = [
+    {
+        "name": "inbox_triage",
+        "description": "Triage unread/unreplied inbox emails into Urgent, Action Required, and Archive.",
+        "arguments": [
+            {
+                "name": "limit",
+                "description": "Max emails to review (default 10)",
+                "required": False
+            }
+        ]
+    },
+    {
+        "name": "daily_briefing",
+        "description": "Generate a morning briefing with new emails, package deliveries, invoices, and calendar events.",
+        "arguments": [
+            {
+                "name": "hours",
+                "description": "Lookback window in hours (default 24)",
+                "required": False
+            }
+        ]
+    },
+    {
+        "name": "draft_reply",
+        "description": "Draft a contextual reply to an email thread matching conversation tone and language.",
+        "arguments": [
+            {
+                "name": "message_id",
+                "description": "Message ID of the email to reply to",
+                "required": True
+            },
+            {
+                "name": "intent",
+                "description": "Key points or instructions for the response",
+                "required": False
+            }
+        ]
+    }
+]
+
+TOOLS_SCHEMA = [
     {
         "name": "spark_get_unread_summary",
         "description": "Get a fast breakdown of unread emails and total counts across all accounts and inboxes.",
@@ -2266,7 +2461,8 @@ TOOLS_SCHEMA = [
                     "description": "Filter by Smart category. Default is 'all'."
                 },
                 "limit": {"type": "integer", "description": "Max threads to return (default 20).", "default": 20},
-                "offset": {"type": "integer", "description": "Offset for pagination.", "default": 0}
+                "offset": {"type": "integer", "description": "Offset for pagination.", "default": 0},
+                "cursor": {"type": "integer", "description": "Cursor for pagination (pass next_cursor from previous page)."}
             }
         }
     },
@@ -2279,19 +2475,6 @@ TOOLS_SCHEMA = [
                 "days": {"type": "integer", "description": "Number of past days to include in digest (default 1).", "default": 1},
                 "account_id": {"type": "integer", "description": "Optional account ID filter."},
                 "limit": {"type": "integer", "description": "Max messages listed across categories (default 50, max 200). Totals still cover the whole period.", "default": 50}
-            }
-        }
-    },
-    {
-        "name": "spark_list_folders",
-        "description": "List folders/mailboxes in Spark Desktop, optionally filtered by account ID.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "account_id": {
-                    "type": "integer",
-                    "description": "Optional account ID to filter folders for a specific account."
-                }
             }
         }
     },
@@ -2324,7 +2507,8 @@ TOOLS_SCHEMA = [
                     "description": "Filter emails received on or before this date/time (ISO 8601 string 'YYYY-MM-DD' or timestamp)."
                 },
                 "limit": {"type": "integer", "description": "Max messages to return (default 10, max 100).", "default": 10},
-                "offset": {"type": "integer", "description": "Offset for pagination.", "default": 0}
+                "offset": {"type": "integer", "description": "Offset for pagination.", "default": 0},
+                "cursor": {"type": "integer", "description": "Cursor for pagination (pass next_cursor from previous page)."}
             }
         }
     },
@@ -2474,13 +2658,19 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "spark_search_messages",
-        "description": "Search emails across all accounts in Spark Desktop using full-text search.",
+        "description": "Search emails across all accounts using FTS5 with BM25 relevance ranking and native snippet match highlighting.",
         "inputSchema": {
             "type": "object",
             "required": ["query"],
             "properties": {
                 "query": {"type": "string", "description": "Search term or phrase."},
-                "limit": {"type": "integer", "description": "Max results to return (default 20).", "default": 20}
+                "limit": {"type": "integer", "description": "Max results to return (default 20).", "default": 20},
+                "sort_by": {
+                    "type": "string",
+                    "enum": ["relevance", "date"],
+                    "description": "Sort order: 'relevance' (BM25 weighted score) or 'date' (most recent first). Default is 'relevance'.",
+                    "default": "relevance"
+                }
             }
         }
     },
@@ -2516,14 +2706,6 @@ TOOLS_SCHEMA = [
             "properties": {
                 "limit": {"type": "integer", "description": "Max subscriptions to return (default 25).", "default": 25}
             }
-        }
-    },
-    {
-        "name": "spark_list_signatures",
-        "description": "List saved email signatures configured for user accounts in Spark Desktop.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {}
         }
     },
     {
@@ -2708,6 +2890,160 @@ def call_cli_tool(name, kw):
 
 
 TOOL_NAMES = {t["name"] for t in TOOLS_SCHEMA}
+COMPAT_TOOLS = {"spark_list_accounts", "spark_list_folders", "spark_list_signatures"}
+
+
+def safe_stdout_write(data_str):
+    """Write data to stdout and flush safely, exiting without stack trace on pipe breakage."""
+    try:
+        sys.stdout.write(data_str)
+        sys.stdout.flush()
+    except (BrokenPipeError, IOError):
+        sys.exit(0)
+
+
+def setup_signal_handlers():
+    """Register termination signal handlers to cleanly release SQLite locks."""
+    def handle_signal(sig, frame):
+        close_all_connections()
+        sys.exit(0)
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(s, handle_signal)
+        except (ValueError, AttributeError):
+            pass
+
+
+def handle_resource_read(uri):
+    """Fetch structured data for an email:// MCP Resource URI."""
+    if uri == "email://accounts":
+        data = spark_list_accounts()
+    elif uri == "email://folders":
+        data = spark_list_folders()
+    elif uri == "email://signatures":
+        data = spark_list_signatures()
+    else:
+        m_msg = re.match(r"^email://messages/(\d+)$", uri)
+        if m_msg:
+            data = spark_get_message(int(m_msg.group(1)))
+        else:
+            m_th = re.match(r"^email://threads/(\d+)$", uri)
+            if m_th:
+                data = spark_get_thread(conversation_id=int(m_th.group(1)))
+            else:
+                raise ValueError(f"Unknown resource URI: {uri}")
+
+    return {
+        "contents": [
+            {
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps(data, ensure_ascii=False, indent=2)
+            }
+        ]
+    }
+
+
+def handle_prompt_inbox_triage(args):
+    limit = int(args.get("limit", 10))
+    summary = spark_get_unread_summary()
+    unreplied = spark_find_unreplied_emails(limit=limit)
+    text = (
+        "You are an executive assistant conducting an inbox triage.\n"
+        "Review the unreplied correspondence and mailbox state below. "
+        "Classify every email into one of three action categories:\n"
+        "1. [URGENT]: Requires immediate same-day response or critical escalation.\n"
+        "2. [ACTION REQUIRED]: Needs follow-up, task creation, or reply this week.\n"
+        "3. [ARCHIVE / FYI]: Informational, newsletter, or already handled.\n\n"
+        f"Mailbox Overview:\n{json.dumps(summary, indent=2, ensure_ascii=False)}\n\n"
+        f"Unreplied Emails:\n{json.dumps(unreplied, indent=2, ensure_ascii=False)}\n\n"
+        "Provide prioritized next steps and concise drafts for any urgent replies."
+    )
+    return {
+        "description": "Triage unread/unreplied inbox emails into Urgent, Action Required, and Archive.",
+        "messages": [
+            {
+                "role": "user",
+                "content": {"type": "text", "text": text}
+            }
+        ]
+    }
+
+
+def handle_prompt_daily_briefing(args):
+    hours = int(args.get("hours", 24))
+    days = max(1, hours // 24)
+    deliveries = spark_find_deliveries(days=days)
+    invoices = spark_find_invoices()
+    events = spark_list_calendar_events(limit=10)
+    summary = spark_get_unread_summary()
+    text = (
+        "Prepare a daily morning briefing based on current Spark Desktop mail and calendar activity.\n\n"
+        f"Inbox Overview:\n{json.dumps(summary, indent=2, ensure_ascii=False)}\n\n"
+        f"Upcoming Calendar Events:\n{json.dumps(events, indent=2, ensure_ascii=False)}\n\n"
+        f"Package Deliveries (last {hours}h):\n{json.dumps(deliveries, indent=2, ensure_ascii=False)}\n\n"
+        f"Invoices & Receipts:\n{json.dumps(invoices, indent=2, ensure_ascii=False)}\n\n"
+        "Summarize the agenda for today, key deliverables, incoming shipments, and outstanding bills."
+    )
+    return {
+        "description": "Generate a morning briefing with new emails, package deliveries, invoices, and calendar events.",
+        "messages": [
+            {
+                "role": "user",
+                "content": {"type": "text", "text": text}
+            }
+        ]
+    }
+
+
+def handle_prompt_draft_reply(args):
+    msg_id = args.get("message_id")
+    if not msg_id:
+        raise ValueError("message_id is required for draft_reply prompt")
+    intent = args.get("intent", "Draft a polite and clear reply addressing all questions.")
+    msg = spark_get_message(int(msg_id))
+    thread_info = []
+    conv_id = msg.get("conversation_id")
+    if conv_id:
+        try:
+            thread_data = spark_get_thread(conversation_id=conv_id)
+            thread_info = thread_data.get("messages", [])
+        except Exception:
+            pass
+
+    text = (
+        f"Draft a response to this email thread.\n\n"
+        f"User Instructions / Intent:\n{intent}\n\n"
+        f"Target Email:\n"
+        f"From: {msg.get('from', '')}\n"
+        f"Subject: {msg.get('subject', '')}\n"
+        f"Date: {msg.get('received_date', '')}\n"
+        f"Body:\n{msg.get('body', '')}\n\n"
+    )
+    if thread_info:
+        text += f"Prior Conversation History ({len(thread_info)} messages):\n{json.dumps(thread_info, indent=2, ensure_ascii=False)}\n\n"
+    text += "Draft the response matching the sender's language, appropriate tone, and clear call-to-actions."
+
+    return {
+        "description": "Draft a contextual reply to an email thread matching conversation tone and language.",
+        "messages": [
+            {
+                "role": "user",
+                "content": {"type": "text", "text": text}
+            }
+        ]
+    }
+
+
+def handle_prompt_get(name, args):
+    """Generate prompt messages for a requested MCP Prompt."""
+    if name == "inbox_triage":
+        return handle_prompt_inbox_triage(args)
+    if name == "daily_briefing":
+        return handle_prompt_daily_briefing(args)
+    if name == "draft_reply":
+        return handle_prompt_draft_reply(args)
+    raise ValueError(f"Prompt not found: {name}")
 
 
 def handle_request(req):
@@ -2716,17 +3052,21 @@ def handle_request(req):
     params = req.get("params", {})
 
     if method == "initialize":
+        client_version = params.get("protocolVersion")
+        protocol_version = client_version if client_version in ("2024-11-05", "0.1.0") else "2024-11-05"
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": protocol_version,
                 "capabilities": {
-                    "tools": {}
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False}
                 },
                 "serverInfo": {
                     "name": "spark-desktop-mcp",
-                    "version": "2.1.0"
+                    "version": "2.2.0"
                 }
             }
         }
@@ -2740,6 +3080,54 @@ def handle_request(req):
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {}
+        }
+
+    if method == "resources/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resources": RESOURCES_SCHEMA
+            }
+        }
+
+    if method == "resources/templates/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resourceTemplates": RESOURCE_TEMPLATES_SCHEMA
+            }
+        }
+
+    if method == "resources/read":
+        uri = params.get("uri")
+        if not uri:
+            raise ValueError("Missing 'uri' parameter in resources/read")
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": handle_resource_read(uri)
+        }
+
+    if method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": PROMPTS_SCHEMA
+            }
+        }
+
+    if method == "prompts/get":
+        prompt_name = params.get("name")
+        prompt_args = params.get("arguments", {})
+        if not prompt_name:
+            raise ValueError("Missing 'name' parameter in prompts/get")
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": handle_prompt_get(prompt_name, prompt_args)
         }
 
     if method == "tools/list":
@@ -2767,14 +3155,38 @@ def handle_request(req):
     if method == "tools/call":
         tool_name = params.get("name")
         args = params.get("arguments", {})
+        meta = params.get("_meta", {})
+        progress_token = meta.get("progressToken")
 
         try:
             if not is_tool_exposed(tool_name):
                 raise PermissionError(f"Tool '{tool_name}' is disabled by SPARK_EXPOSED_TOOLS.")
 
+            # Create progress callback if client provided a progressToken
+            progress_cb = None
+            if progress_token is not None:
+                def progress_cb(progress, total=None, message=None):
+                    notif = {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": progress_token,
+                            "progress": progress
+                        }
+                    }
+                    if total is not None:
+                        notif["params"]["total"] = total
+                    if message:
+                        notif["params"]["message"] = str(message)
+                    safe_stdout_write(json.dumps(notif, ensure_ascii=False) + "\n")
+
             # Schema names are the allowlist; argument defaults live on the functions.
-            if tool_name in TOOL_NAMES:
-                res = globals()[tool_name](**args)
+            if tool_name in TOOL_NAMES or tool_name in COMPAT_TOOLS:
+                fn = globals()[tool_name]
+                sig = inspect.signature(fn)
+                if "progress_callback" in sig.parameters:
+                    args["progress_callback"] = progress_cb
+                res = fn(**args)
             else:
                 if tool_name not in CLI_CATALOG:
                     refresh_cli_catalog(max_age=30)
@@ -2971,6 +3383,7 @@ def uninstall_mcp():
 
 
 def main():
+    setup_signal_handlers()
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
         if cmd in ("--install", "-i", "install"):
@@ -2999,15 +3412,13 @@ def main():
             req = json.loads(line)
             resp = handle_request(req)
             if resp is not None:
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                safe_stdout_write(json.dumps(resp, ensure_ascii=False) + "\n")
         except Exception as e:
             sys.stderr.write(f"Protocol error: {e}\n")
             sys.stderr.flush()
             if isinstance(req, dict) and "id" in req:  # never leave a request unanswered
-                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                safe_stdout_write(json.dumps({"jsonrpc": "2.0", "id": req["id"],
                                              "error": {"code": -32603, "message": str(e)}}) + "\n")
-                sys.stdout.flush()
 
 
 if __name__ == "__main__":
