@@ -208,6 +208,25 @@ Ask your assistant, for example:
 - `spark_compose_email`: open a new pre-filled message in Spark (supports emails or contact names with automatic address resolution).
 - `spark_reply_to_email`: open a pre-filled reply (respects `Reply-To`, `Re:` subject, signature in the message language).
 
+## OCR for scanned PDFs (macOS)
+
+`spark_inspect_attachment` reads PDFs in this order:
+
+1. Text layer via `pypdf` / `PyPDF2` (optional, `pip install pypdf`).
+2. Text already indexed by Spark (`attachmentsfts`).
+3. **OCR fallback** with macOS Vision (Russian, German, English), only if 1 and 2 returned nothing, i.e. for scans.
+
+How it works: `ocr_pdf.swift` (PDFKit + Vision, system frameworks only) is compiled once with `swiftc` into `~/.cache/spark-mcp/ocr_pdf` (the first scan takes a few extra seconds) and called as a subprocess. Requirements: macOS and Xcode Command Line Tools (`xcode-select --install`). No pip packages are needed.
+
+Note: this is the one case where a PDF touches disk. It is written to a private temp file (mode 0600) for the duration of the OCR run and deleted right after. Nothing is sent over the network.
+
+| Env variable | Default | Meaning |
+|---|---|---|
+| `SPARK_OCR_MAX_PAGES` | `30` | Max pages to recognize per document (a truncation marker is added) |
+| `SPARK_OCR_TIMEOUT` | `120` | OCR timeout in seconds |
+
+If OCR is unavailable (not macOS, no `swiftc`, compile error), the previous "no text layer" message is returned together with the reason.
+
 ## Limitations
 
 - **Sender account.** A `mailto:` link cannot select the sender, so Spark always opens the draft from the default account. Switch the sender in the composer before replying from another mailbox.

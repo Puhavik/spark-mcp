@@ -22,6 +22,7 @@ import atexit
 import signal
 import inspect
 import shutil
+import tempfile
 import time
 import subprocess
 import urllib.parse
@@ -256,6 +257,95 @@ class PersistentConnProxy:
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
+
+
+# --- OCR fallback for scanned PDFs (macOS Vision via a small Swift helper) ---
+OCR_SWIFT_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_pdf.swift")
+OCR_BIN_DIR = os.path.join(os.path.expanduser("~"), ".cache", "spark-mcp")
+OCR_BIN = os.path.join(OCR_BIN_DIR, "ocr_pdf")
+
+
+def _env_int(name, default):
+    try:
+        value = int(os.environ.get(name, ""))
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _ensure_ocr_binary():
+    """Compile ocr_pdf.swift into a cached binary. Returns (path, error)."""
+    if sys.platform != "darwin":
+        return None, "OCR via macOS Vision is only available on macOS."
+    if not os.path.isfile(OCR_SWIFT_SRC):
+        return None, "ocr_pdf.swift not found next to spark_mcp.py."
+    try:
+        if (os.path.isfile(OCR_BIN) and os.access(OCR_BIN, os.X_OK)
+                and os.path.getmtime(OCR_BIN) >= os.path.getmtime(OCR_SWIFT_SRC)):
+            return OCR_BIN, None
+    except OSError:
+        pass
+    swiftc = shutil.which("swiftc") or ("/usr/bin/swiftc" if os.path.exists("/usr/bin/swiftc") else None)
+    if not swiftc:
+        return None, "swiftc not found (install Xcode Command Line Tools: xcode-select --install)."
+    tmp_bin = OCR_BIN + f".{os.getpid()}.tmp"
+    try:
+        os.makedirs(OCR_BIN_DIR, exist_ok=True)
+        proc = subprocess.run(
+            [swiftc, "-O", "-swift-version", "5", OCR_SWIFT_SRC, "-o", tmp_bin],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180
+        )
+        if proc.returncode != 0:
+            tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["unknown error"]
+            return None, f"failed to compile ocr_pdf.swift: {tail[0]}"
+        os.replace(tmp_bin, OCR_BIN)
+        return OCR_BIN, None
+    except subprocess.TimeoutExpired:
+        return None, "compiling ocr_pdf.swift timed out."
+    except Exception as e:
+        return None, f"failed to prepare OCR helper: {e}"
+    finally:
+        try:
+            if os.path.exists(tmp_bin):
+                os.remove(tmp_bin)
+        except OSError:
+            pass
+
+
+def _ocr_pdf_with_vision(data, max_pages=None, timeout=None):
+    """OCR a PDF (bytes) with macOS Vision. Returns (text, error); exactly one is None."""
+    max_pages = max_pages or _env_int("SPARK_OCR_MAX_PAGES", 30)
+    timeout = timeout or _env_int("SPARK_OCR_TIMEOUT", 120)
+    binary, err = _ensure_ocr_binary()
+    if not binary:
+        return None, err
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="spark-ocr-")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        proc = subprocess.run(
+            [binary, tmp_path, "--max-pages", str(max_pages)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
+        )
+        if proc.returncode != 0:
+            tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [f"exit code {proc.returncode}"]
+            return None, f"OCR failed: {tail[0]}"
+        text = proc.stdout.decode("utf-8", "replace").strip()
+        body = re.sub(r"^--- (?:Page \d+|TRUNCATED[^\n]*) ---$", "", text, flags=re.M).strip()
+        if not body:
+            return None, "OCR found no recognizable text."
+        return text, None
+    except subprocess.TimeoutExpired:
+        return None, f"OCR timed out after {timeout}s."
+    except Exception as e:
+        return None, f"OCR failed: {e}"
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def get_ro_conn(db_path):
@@ -1084,9 +1174,8 @@ def spark_inspect_attachment(attachment_id=None, message_id=None, filename=None,
             except Exception as e:
                 read_error = e
 
-            del data
-
             if has_any_text:
+                del data
                 full_text = "\n\n".join(text_pages).strip()
                 return f"Contents of document '{att_name}' ({len(text_pages)} pages):\n\n{full_text}"
 
@@ -1103,14 +1192,23 @@ def spark_inspect_attachment(attachment_id=None, message_id=None, filename=None,
                 except Exception:
                     pass
 
+            # OCR fallback (macOS Vision) for scans without a text layer
+            ocr_text, ocr_error = _ocr_pdf_with_vision(data)
+            del data
+            if ocr_text:
+                ocr_pages = len(re.findall(r"^--- Page \d+ ---$", ocr_text, flags=re.M))
+                return f"Contents of document '{att_name}' (OCR via macOS Vision, {ocr_pages} pages):\n\n{ocr_text}"
+            ocr_note = f" OCR fallback failed: {ocr_error}" if ocr_error else ""
+
             if read_error and not text_pages:
-                return f"Error reading PDF '{att_name}': {str(read_error)}"
+                return f"Error reading PDF '{att_name}': {str(read_error)}.{ocr_note}"
 
             pages_count = len(text_pages) if text_pages else 0
             pages_info = f" ({pages_count} pages)" if pages_count else ""
             return (
                 f"Document '{att_name}'{pages_info} "
                 "does not contain a text layer (possibly a scanned image without OCR)."
+                f"{ocr_note}"
             )
 
         # 3. If this is a Word document (.docx)

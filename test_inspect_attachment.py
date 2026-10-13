@@ -122,6 +122,102 @@ def test_pdf_inspection_in_ram():
         assert fake_pdf_text in res
 
 
+def _run_pdf_inspection(page_texts, ocr_return=None, ocr_side_effect=None):
+    """Helper: inspect a fake PDF whose pypdf pages return page_texts; OCR is mocked."""
+    mock_att = {
+        "pk": 190,
+        "messagePk": 290,
+        "attachmentName": "scan.pdf",
+        "attachmentSize": 1000,
+        "attachmentMIMEType": "application/pdf",
+        "attachmentURL": "",
+        "accountPk": 1,
+    }
+
+    class MockPage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class MockReader:
+        def __init__(self, stream):
+            self.pages = [MockPage(t) for t in page_texts]
+
+    ocr_mock = MagicMock(return_value=ocr_return, side_effect=ocr_side_effect)
+    with patch("spark_mcp.get_ro_conn") as mock_conn, \
+         patch("spark_mcp.SEARCH_DB", "/nonexistent/search_fts5.sqlite"), \
+         patch("spark_mcp.find_cached_attachment_file", return_value="/tmp/scan.pdf"), \
+         patch("spark_mcp._ocr_pdf_with_vision", ocr_mock), \
+         patch("os.path.isfile", return_value=True), \
+         patch("builtins.open", MagicMock(return_value=io.BytesIO(b"%PDF-1.4..."))), \
+         patch.dict("sys.modules", {"pypdf": MagicMock(PdfReader=MockReader)}):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = mock_att
+        mock_conn.return_value.cursor.return_value = mock_cursor
+        res = spark_mcp.spark_inspect_attachment(attachment_id=190)
+    return res, ocr_mock
+
+
+def test_pdf_text_layer_skips_ocr():
+    res, ocr_mock = _run_pdf_inspection(["Real text layer"])
+    assert "Real text layer" in res
+    ocr_mock.assert_not_called()
+
+
+def test_pdf_scan_uses_ocr_fallback():
+    ocr_text = "--- Page 1 ---\nСчёт № 114\nGesamtbetrag 1.234,50 EUR"
+    res, ocr_mock = _run_pdf_inspection([""], ocr_return=(ocr_text, None))
+    ocr_mock.assert_called_once()
+    assert "OCR via macOS Vision, 1 pages" in res
+    assert "Gesamtbetrag 1.234,50 EUR" in res
+
+
+def test_pdf_scan_ocr_unavailable_keeps_old_message():
+    res, _ = _run_pdf_inspection([""], ocr_return=(None, "swiftc not found"))
+    assert "does not contain a text layer (possibly a scanned image without OCR)." in res
+    assert "OCR fallback failed: swiftc not found" in res
+
+
+def test_ocr_helper_failure_modes():
+    # Non-macOS: no compile attempt, clear error
+    with patch("spark_mcp.sys.platform", "linux"):
+        text, err = spark_mcp._ocr_pdf_with_vision(b"%PDF-1.4")
+        assert text is None and "only available on macOS" in err
+    # Missing swiftc
+    with patch("spark_mcp.sys.platform", "darwin"), \
+         patch("spark_mcp.OCR_SWIFT_SRC", __file__), \
+         patch("spark_mcp.OCR_BIN", "/nonexistent/ocr_pdf"), \
+         patch("spark_mcp.shutil.which", return_value=None), \
+         patch("spark_mcp.os.path.exists", return_value=False):
+        text, err = spark_mcp._ocr_pdf_with_vision(b"%PDF-1.4")
+        assert text is None and "swiftc not found" in err
+
+
+def test_ocr_helper_runs_binary_and_cleans_temp_file():
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["path"] = cmd[1]
+        assert os.path.isfile(cmd[1])
+        assert (os.stat(cmd[1]).st_mode & 0o777) == 0o600
+        return MagicMock(returncode=0, stdout="--- Page 1 ---\nHallo Welt\n".encode("utf-8"), stderr=b"")
+
+    with patch("spark_mcp._ensure_ocr_binary", return_value=("/fake/ocr_pdf", None)), \
+         patch("spark_mcp.subprocess.run", side_effect=fake_run):
+        text, err = spark_mcp._ocr_pdf_with_vision(b"%PDF-1.4")
+    assert err is None and "Hallo Welt" in text
+    assert not os.path.exists(seen["path"])  # temp file removed
+
+    # Empty OCR result -> error, still cleaned up
+    with patch("spark_mcp._ensure_ocr_binary", return_value=("/fake/ocr_pdf", None)), \
+         patch("spark_mcp.subprocess.run", side_effect=lambda cmd, **kw: (seen.update(path=cmd[1]) or MagicMock(returncode=0, stdout=b"--- Page 1 ---\n\n", stderr=b""))):
+        text, err = spark_mcp._ocr_pdf_with_vision(b"%PDF-1.4")
+    assert text is None and "no recognizable text" in err
+    assert not os.path.exists(seen["path"])
+
+
 def test_handle_request_protocol():
     # Test image unwrapping in JSON-RPC handle_request
     fake_png = b"\x89PNG\r\n\x1a\nfakeimagebytes"
@@ -623,6 +719,11 @@ if __name__ == "__main__":
     test_image_inspection_in_ram()
     test_text_inspection_in_ram()
     test_pdf_inspection_in_ram()
+    test_pdf_text_layer_skips_ocr()
+    test_pdf_scan_uses_ocr_fallback()
+    test_pdf_scan_ocr_unavailable_keeps_old_message()
+    test_ocr_helper_failure_modes()
+    test_ocr_helper_runs_binary_and_cleans_temp_file()
     test_docx_inspection_in_ram()
     test_xlsx_inspection_in_ram()
     test_prompt_injection_sanitizer()
